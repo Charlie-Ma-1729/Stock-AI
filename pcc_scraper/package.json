@@ -1,0 +1,14 @@
+{
+  "name": "pcc-scraper",
+  "version": "1.0.0",
+  "description": "Scraper for government e-procurement system",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "start:ubuntu": "HEADLESS=true node index.js"
+  },
+  "dependencies": {
+    "pdf-parse": "^2.4.5",
+    "puppeteer": "^24.40.0"
+  }
+}
