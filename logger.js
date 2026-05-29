@@ -13,7 +13,7 @@ function getTodayLogFilePath() {
     const dateStr = new Date(today.getTime() - (today.getTimezoneOffset() * 60000))
         .toISOString()
         .split('T')[0];
-    return path.join(logDir, `cmoney_scraper_${dateStr}.log`);
+    return path.join(logDir, `${dateStr}.log`);
 }
 
 // 格式化訊息

@@ -1,8 +1,8 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs');
-const { isArticleExists, saveNewsWithTags } = require('./db');
-const logger = require('./logger');
+const { isArticleExists, saveNewsWithTags } = require('../db');
+const logger = require('../logger');
 
 // ==========================================
 // 📚 1. 載入台美股字典
