@@ -3,6 +3,11 @@
     "axios": "^1.16.1",
     "better-sqlite3": "^12.10.0",
     "cheerio": "^1.2.0",
-    "iconv-lite": "^0.7.2"
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "iconv-lite": "^0.7.2",
+    "node-cron": "^4.2.1",
+    "node-twstock": "^2.2.2",
+    "yahoo-finance2": "^3.14.2"
   }
 }
