@@ -11,6 +11,9 @@ const logger = require('./logger'); // 請確保路徑正確
 const dbPath = path.join(__dirname, 'stock_ai.db');
 const db = new Database(dbPath);
 
+// 啟動外鍵約束，確保資料庫關聯乾淨
+db.pragma('foreign_keys = ON');
+
 // 初始化資料庫結構
 function initDB() {
     // 1. 新聞主檔
@@ -18,8 +21,8 @@ function initDB() {
       CREATE TABLE IF NOT EXISTS articles (
         url TEXT PRIMARY KEY,
         title TEXT NOT NULL,
-        summary TEXT,
-        content TEXT,
+        summary TEXT, -- 這裡未來將只存放 AI 濃縮後的心血結晶
+        content TEXT, -- 將會保持為空，不佔用空間
         published_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         ai_importance_score INTEGER DEFAULT 0
       );
@@ -31,7 +34,7 @@ function initDB() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL,
         article_url TEXT NOT NULL,
-        FOREIGN KEY(article_url) REFERENCES articles(url)
+        FOREIGN KEY(article_url) REFERENCES articles(url) ON DELETE CASCADE
       );
     `);
 
@@ -74,6 +77,7 @@ initVectorDB();
 // ==========================================
 const stmts = {
     checkArticleExists: db.prepare(`SELECT 1 FROM articles WHERE url = ?`),
+    // 現在存入 DB 時，summary 裝的會是 AI 已經濃縮好的精華，content 直接放空字串即可
     insertArticle: db.prepare(`INSERT OR IGNORE INTO articles (url, title, summary, content) VALUES (?, ?, ?, ?)`),
     insertStockMap: db.prepare(`INSERT OR IGNORE INTO stock_news_map (symbol, article_url) VALUES (?, ?)`),
     getRecentNews: db.prepare(`
@@ -83,9 +87,10 @@ const stmts = {
         WHERE a.published_at >= datetime('now', '-' || ? || ' hours')
         GROUP BY a.url
     `),
-    insertPrediction: db.prepare(`INSERT INTO predictions (source, symbol, prediction_text, created_at, target_date) VALUES (?, ?, ?, ?, ?)`),
-    getPendingPredictions: db.prepare(`SELECT * FROM predictions WHERE status = 'PENDING' AND target_date <= ?`),
-    updatePredictionStatus: db.prepare(`UPDATE predictions SET status = 'EVALUATED' WHERE id = ?`)
+    // 新增：刪除 36 小時以前的新聞主檔
+    deleteOldArticles: db.prepare(`DELETE FROM articles WHERE published_at < datetime('now', '-36 hours')`),
+    // 新增：清除沒有對應新聞的孤兒映射 (安全機制)
+    deleteOrphanMaps: db.prepare(`DELETE FROM stock_news_map WHERE article_url NOT IN (SELECT url FROM articles)`)
 };
 
 function isArticleExists(url) {
@@ -93,6 +98,7 @@ function isArticleExists(url) {
 }
 
 const saveNewsWithTags = db.transaction((articleData, symbols) => {
+    // 存入文章 (content 預期為空字串，以節省空間)
     stmts.insertArticle.run(articleData.url, articleData.title, articleData.summary, articleData.content);
     for (const symbol of symbols) {
         stmts.insertStockMap.run(symbol, articleData.url);
@@ -100,14 +106,29 @@ const saveNewsWithTags = db.transaction((articleData, symbols) => {
 });
 
 /**
- * 取得最近 X 小時內抓取的新聞 (供 AI 濃縮分析用)
+ * 取得最近 X 小時內的新聞 (現在拿出來的直接是 AI 濃縮過的 summary)
  */
 function getRecentNews(hours = 12) {
     const rows = stmts.getRecentNews.all(hours);
     return rows.map(row => ({
         ...row,
-        symbols: row.symbols ? row.symbols.split(',') : [] // 把逗號分隔的字串轉回陣列
+        symbols: row.symbols ? row.symbols.split(',') : []
     }));
+}
+
+/**
+ * [新增功能] 清理 36 小時前的老舊新聞，維持系統輕量化
+ */
+function cleanOldNews() {
+    try {
+        const info1 = stmts.deleteOldArticles.run();
+        const info2 = stmts.deleteOrphanMaps.run();
+        if (info1.changes > 0 || info2.changes > 0) {
+            logger.info(`🗑️ [DB] 自動清理完成：已刪除 ${info1.changes} 篇過期(36小時前)新聞，及 ${info2.changes} 筆無效標籤。`);
+        }
+    } catch (err) {
+        logger.error(`❌ [DB] 清理舊新聞失敗: ${err.message}`);
+    }
 }
 
 // ==========================================
@@ -169,7 +190,6 @@ async function queryVectorMemory(text, topK = 3) {
     if (!vector) return [];
 
     const results = await vectorIndex.queryItems(vector, topK);
-    // 只取相似度 > 0.7 的記憶
     return results.filter(r => r.score > 0.7).map(r => r.item.metadata);
 }
 
@@ -177,6 +197,7 @@ module.exports = {
     isArticleExists,
     saveNewsWithTags,
     getRecentNews,
+    cleanOldNews, // 將新功能匯出，讓 Scheduler 可以定期呼叫
     savePrediction,
     getDuePredictions,
     markPredictionEvaluated,

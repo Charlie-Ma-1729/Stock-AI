@@ -1,7 +1,10 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs');
-const { isArticleExists, saveNewsWithTags } = require('./db');
+const path = require('path');
+// 注意：移除了 saveNewsWithTags，因為寫入資料庫的工作已經交由 scheduler (ETL的Load階段) 處理
+// 保留 isArticleExists 用於判斷是否遇到舊新聞，以提早中斷爬蟲
+const { isArticleExists } = require('./db');
 const logger = require('./logger');
 
 // ==========================================
@@ -10,14 +13,18 @@ const logger = require('./logger');
 let twStocks = {};
 let usStocks = {};
 
-if (fs.existsSync('./tw_stocks.json')) {
-    twStocks = require('./tw_stocks.json');
+// 若執行目錄不同，建議使用絕對路徑或確保相對路徑正確
+const twDictPath = path.join(__dirname, 'tw_stocks.json');
+const usDictPath = path.join(__dirname, 'us_stocks.json');
+
+if (fs.existsSync(twDictPath)) {
+    twStocks = require(twDictPath);
 } else {
     logger.warn('⚠️ 找不到 tw_stocks.json！請確認是否已執行 update_twse_dict.js');
 }
 
-if (fs.existsSync('./us_stocks.json')) {
-    usStocks = require('./us_stocks.json');
+if (fs.existsSync(usDictPath)) {
+    usStocks = require(usDictPath);
 } else {
     logger.warn('⚠️ 找不到 us_stocks.json！請確認是否已執行 update_us_dict.js');
 }
@@ -100,16 +107,17 @@ async function parseArticlePage(url, articleTitle) {
         return { content, symbols: verifiedSymbols };
 
     } catch (error) {
-        logger.error(`無法解析文章頁面: ${url} | 錯誤: ${error.message}`);
+        logger.error(`❌ 無法解析文章頁面: ${url} | 錯誤: ${error.message}`);
         return { content: '', symbols: [] };
     }
 }
 
 /**
- * 爬取單一板塊
+ * 爬取單一板塊，並將結果收集成陣列回傳
  */
 async function scrapeCategory(listUrl) {
-    logger.info(`🔍 開始掃描板塊: ${listUrl}`);
+    logger.info(`🔍 [Extract] 開始掃描板塊: ${listUrl}`);
+    const scrapedArticles = [];
     
     try {
         const { data } = await axios.get(listUrl);
@@ -118,10 +126,8 @@ async function scrapeCategory(listUrl) {
         
         if (cards.length === 0) {
             logger.warn(`⚠️ [異常] 此板塊抓不到任何新聞卡片，請檢查網頁是否改版: ${listUrl}`);
-            return;
+            return scrapedArticles; // 回傳空陣列
         }
-
-        let newArticleCount = 0;
 
         for (const card of cards) {
             const $card = $(card);
@@ -132,12 +138,11 @@ async function scrapeCategory(listUrl) {
             
             // 【停止條件】遇到已存入資料庫的文章，代表後續皆為舊聞，跳出此板塊
             if (isArticleExists(articleUrl)) {
-                logger.info(`🛑 遇到已存入的新聞，跳出本板塊掃描。`);
+                logger.info(`🛑 [Extract] 遇到已存在 DB 的舊新聞，停止掃描本板塊。`);
                 break; 
             }
 
             const title = $card.find('.articleCard__title').text().trim();
-            const summary = $card.find('.articleCard__desc').text().trim();
 
             // 進入文章解析與字典驗證引擎
             const { content, symbols } = await parseArticlePage(articleUrl, title);
@@ -149,50 +154,59 @@ async function scrapeCategory(listUrl) {
                 return s;
             });
 
-            logger.info(`📥 處理中: [${title}]`);
-            logger.info(`   🏷️ 萃取代號: ${displaySymbols.length > 0 ? displaySymbols.join(', ') : '無'}`);
+            logger.info(`📥 [Extract] 萃取成功: [${title}]`);
+            logger.info(`   🏷️ 關聯代號: ${displaySymbols.length > 0 ? displaySymbols.join(', ') : '無'}`);
 
             if (!content || content.length === 0) {
                 logger.warn(`⚠️ [異常] 抓取到空內文: ${articleUrl}`);
             }
 
-            // 存入資料庫
-            saveNewsWithTags({
+            // 將萃取好的資料推入陣列，等待回傳給排程器處理
+            scrapedArticles.push({
                 url: articleUrl,
                 title: title,
-                summary: summary,
-                content: content
-            }, symbols);
-
-            newArticleCount++;
+                content: content,
+                symbols: symbols
+            });
             
-            // 防禦性延遲 (隨機 1~3 秒)
+            // 防禦性延遲 (隨機 1~3 秒) 避免被封鎖
             await new Promise(res => setTimeout(res, 1000 + Math.random() * 2000));
         }
 
-        logger.info(`✅ 板塊掃描完畢，共新增 ${newArticleCount} 篇新聞。`);
+        logger.info(`✅ [Extract] 板塊掃描完畢，本板塊共萃取 ${scrapedArticles.length} 篇新文章。`);
 
     } catch (error) {
-        logger.error(`❌ 板塊掃描發生錯誤: ${listUrl} | 錯誤: ${error.message}`);
+        logger.error(`❌ [Extract] 板塊掃描發生錯誤: ${listUrl} | 錯誤: ${error.message}`);
     }
+
+    return scrapedArticles;
 }
 
 /**
- * 爬蟲主程式啟動點
+ * 爬蟲主程式 (供 Scheduler 呼叫)
+ * @returns {Array} 包含所有新爬取文章的陣列
  */
-async function startCMoneyScraper() {
+async function scrape() {
     logger.info('==================================================');
-    logger.info('🚀 CMoney 多板塊爬蟲啟動 (搭載台美雙字典驗證)');
+    logger.info('🚀 CMoney 多板塊爬蟲啟動 (啟動 ETL Extract 階段)');
     logger.info('==================================================');
+    
+    let allNewArticles = [];
 
     for (const url of TARGET_URLS) {
-        await scrapeCategory(url);
+        const articles = await scrapeCategory(url);
+        if (articles && articles.length > 0) {
+            allNewArticles = allNewArticles.concat(articles);
+        }
         // 切換板塊時休息 2~4 秒
         await new Promise(res => setTimeout(res, 2000 + Math.random() * 2000));
     }
 
-    logger.info('🏁 所有板塊爬取完畢！');
+    logger.info(`🏁 [Extract] CMoney 全板塊爬取完畢！共將交接 ${allNewArticles.length} 篇原始新聞給 AI 進行 Q4 濃縮。`);
+    
+    // 回傳給 scheduler
+    return allNewArticles;
 }
 
-// 執行
-startCMoneyScraper();
+// 匯出 scrape 函數給 scheduler 統一調度
+module.exports = { scrape };

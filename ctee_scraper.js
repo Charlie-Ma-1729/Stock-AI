@@ -1,7 +1,9 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs');
-const { isArticleExists, saveNewsWithTags } = require('./db');
+const path = require('path');
+// 注意：移除了 saveNewsWithTags，因為寫入資料庫的工作已經交由 scheduler (ETL的Load階段) 處理
+const { isArticleExists } = require('./db');
 const logger = require('./logger');
 
 // ==========================================
@@ -10,14 +12,17 @@ const logger = require('./logger');
 let twStocks = {};
 let usStocks = {};
 
-if (fs.existsSync('./tw_stocks.json')) {
-    twStocks = require('./tw_stocks.json');
+const twDictPath = path.join(__dirname, 'tw_stocks.json');
+const usDictPath = path.join(__dirname, 'us_stocks.json');
+
+if (fs.existsSync(twDictPath)) {
+    twStocks = require(twDictPath);
 } else {
     logger.warn('⚠️ 找不到 tw_stocks.json！請先執行 update_twse_dict.js');
 }
 
-if (fs.existsSync('./us_stocks.json')) {
-    usStocks = require('./us_stocks.json');
+if (fs.existsSync(usDictPath)) {
+    usStocks = require(usDictPath);
 } else {
     logger.warn('⚠️ 找不到 us_stocks.json！請先執行 update_us_dict.js');
 }
@@ -125,16 +130,17 @@ async function parseCteeArticlePage(url, articleTitle) {
         return { content, symbols: verifiedSymbols };
 
     } catch (error) {
-        logger.error(`無法解析 工商時報 文章頁面: ${url} | 錯誤: ${error.message}`);
+        logger.error(`❌ [Extract] 無法解析 工商時報 文章頁面: ${url} | 錯誤: ${error.message}`);
         return { content: '', symbols: [] };
     }
 }
 
 /**
- * 爬取 工商時報 即時新聞列表
+ * 爬取 工商時報 即時新聞列表，回傳萃取陣列
  */
 async function scrapeCteeNews() {
-    logger.info(`🔍 開始掃描 工商時報 即時新聞: ${CTEE_NEWS_URL}`);
+    logger.info(`🔍 [Extract] 開始掃描 工商時報 即時新聞: ${CTEE_NEWS_URL}`);
+    const scrapedArticles = [];
     
     try {
         const { data } = await axios.get(CTEE_NEWS_URL);
@@ -145,10 +151,8 @@ async function scrapeCteeNews() {
         
         if (cards.length === 0) {
             logger.warn(`⚠️ [異常] 抓不到任何 工商時報 新聞卡片，請檢查 DOM 結構是否改變。`);
-            return;
+            return scrapedArticles;
         }
-
-        let newArticleCount = 0;
 
         for (const card of cards) {
             const $card = $(card);
@@ -157,12 +161,10 @@ async function scrapeCteeNews() {
             const $linkEl = $card.find('h3.news-title a');
             let relativeUrl = $linkEl.attr('href');
             const title = $linkEl.text().trim();
-            // 工商時報的列表卡片沒有摘要段落，直接留空即可
-            const summary = ''; 
 
             if (!relativeUrl || !title) continue;
             
-            // 補全相對路徑 (例如: /news/20260529700700-430201 -> https://www.ctee.com.tw/news/...)
+            // 補全相對路徑
             const articleUrl = relativeUrl.startsWith('http') ? relativeUrl : BASE_URL + relativeUrl;
 
             // 防呆過濾：只允許 CTEE 內部新聞連結
@@ -172,7 +174,7 @@ async function scrapeCteeNews() {
             
             // 【停止條件】遇到已存入資料庫的文章，代表後續皆為舊聞，跳出掃描
             if (isArticleExists(articleUrl)) {
-                logger.info(`🛑 遇到已存入的 工商時報 新聞，掃描結束。`);
+                logger.info(`🛑 [Extract] 遇到已存在 DB 的舊新聞，停止 工商時報 掃描。`);
                 break; 
             }
 
@@ -185,46 +187,49 @@ async function scrapeCteeNews() {
                 return s;
             });
 
-            logger.info(`📥 [CTEE] 處理中: [${title}]`);
-            logger.info(`   🏷️ 萃取代號: ${displaySymbols.length > 0 ? displaySymbols.join(', ') : '無'}`);
+            logger.info(`📥 [Extract] CTEE 萃取成功: [${title}]`);
+            logger.info(`   🏷️ 關聯代號: ${displaySymbols.length > 0 ? displaySymbols.join(', ') : '無'}`);
 
             if (!content || content.length === 0) {
                 logger.warn(`⚠️ [異常] 抓取到空內文 (可能是特殊排版): ${articleUrl}`);
             }
 
-            // 存入共用的資料庫模組
-            saveNewsWithTags({
+            // 將資料推入陣列
+            scrapedArticles.push({
                 url: articleUrl,
                 title: title,
-                summary: summary,
-                content: content
-            }, symbols);
-
-            newArticleCount++;
+                content: content,
+                symbols: symbols
+            });
             
-            // 防禦性延遲 (隨機 1~3 秒)，避免被當成惡意攻擊阻擋
+            // 防禦性延遲 (隨機 1~3 秒)
             await new Promise(res => setTimeout(res, 1000 + Math.random() * 2000));
         }
 
-        logger.info(`✅ 工商時報 新聞掃描完畢，共新增 ${newArticleCount} 篇新聞。`);
+        logger.info(`✅ [Extract] 工商時報 掃描完畢，共萃取 ${scrapedArticles.length} 篇新新聞。`);
 
     } catch (error) {
-        logger.error(`❌ 工商時報 掃描發生錯誤 | 錯誤: ${error.message}`);
+        logger.error(`❌ [Extract] 工商時報 掃描發生錯誤 | 錯誤: ${error.message}`);
     }
+
+    return scrapedArticles;
 }
 
 /**
- * 爬蟲主程式啟動點
+ * 爬蟲主程式 (供 Scheduler 呼叫)
+ * @returns {Array} 包含所有新爬取文章的陣列
  */
-async function startCteeScraper() {
+async function scrape() {
     logger.info('==================================================');
-    logger.info('🚀 工商時報 爬蟲啟動 (輕量化黑名單 + 全方位智慧反查)');
+    logger.info('🚀 工商時報 爬蟲啟動 (啟動 ETL Extract 階段)');
     logger.info('==================================================');
 
-    await scrapeCteeNews();
+    const allNewArticles = await scrapeCteeNews();
 
-    logger.info('🏁 工商時報 爬取完畢！');
+    logger.info(`🏁 [Extract] 工商時報 爬取完畢！共將交接 ${allNewArticles.length} 篇原始新聞給 AI 進行 Q4 濃縮。`);
+    
+    return allNewArticles;
 }
 
-// 執行
-startCteeScraper();
+// 匯出 scrape 函數給 scheduler 統一調度
+module.exports = { scrape };

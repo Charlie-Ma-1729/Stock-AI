@@ -1,7 +1,9 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs');
-const { isArticleExists, saveNewsWithTags } = require('./db');
+const path = require('path');
+// 注意：移除了 saveNewsWithTags，寫入資料庫由 scheduler (ETL Load 階段) 負責
+const { isArticleExists } = require('./db');
 const logger = require('./logger');
 
 // ==========================================
@@ -10,14 +12,18 @@ const logger = require('./logger');
 let twStocks = {};
 let usStocks = {};
 
-if (fs.existsSync('./tw_stocks.json')) {
-    twStocks = require('./tw_stocks.json');
+// 使用 path.join 確保相對路徑在不同執行環境下皆正確
+const twDictPath = path.join(__dirname, 'tw_stocks.json');
+const usDictPath = path.join(__dirname, 'us_stocks.json');
+
+if (fs.existsSync(twDictPath)) {
+    twStocks = require(twDictPath);
 } else {
     logger.warn('⚠️ 找不到 tw_stocks.json！請先執行 update_twse_dict.js');
 }
 
-if (fs.existsSync('./us_stocks.json')) {
-    usStocks = require('./us_stocks.json');
+if (fs.existsSync(usDictPath)) {
+    usStocks = require(usDictPath);
 } else {
     logger.warn('⚠️ 找不到 us_stocks.json！請先執行 update_us_dict.js');
 }
@@ -44,8 +50,16 @@ const NAME_BLACKLIST = new Set([
     '統一', '幸福', '地球', '全國', '卓越', '立德', '世界', '未來'
 ]);
 
-const UDN_NEWS_URL = 'https://money.udn.com/rank/newest/1001/0/1';
 const BASE_URL = 'https://money.udn.com';
+
+// 🎯 更新：將原本單一網址替換成陣列，包含使用者指定的 5 個新目標板塊
+const TARGET_URLS = [
+    'https://money.udn.com/rank/newest/1001/5591/1',
+    'https://money.udn.com/rank/newest/1001/5590/1',
+    'https://money.udn.com/rank/newest/1001/12017/1',
+    'https://money.udn.com/rank/newest/1001/11111/1',
+    'https://money.udn.com/rank/newest/1001/5592/1'
+];
 
 /**
  * 深度解析 經濟日報 文章頁面
@@ -118,30 +132,30 @@ async function parseUdnArticlePage(url, articleTitle) {
         return { content, symbols: verifiedSymbols };
 
     } catch (error) {
-        logger.error(`無法解析 經濟日報 文章頁面: ${url} | 錯誤: ${error.message}`);
+        logger.error(`❌ [Extract] 無法解析 經濟日報 文章頁面: ${url} | 錯誤: ${error.message}`);
         return { content: '', symbols: [] };
     }
 }
 
 /**
- * 爬取 經濟日報 最新新聞列表
+ * 爬取 單一 經濟日報 板塊，回傳萃取陣列
+ * @param {string} listUrl 要掃描的目標板塊網址
  */
-async function scrapeUdnNews() {
-    logger.info(`🔍 開始掃描 經濟日報 最新新聞: ${UDN_NEWS_URL}`);
+async function scrapeCategory(listUrl) {
+    logger.info(`🔍 [Extract] 開始掃描 經濟日報 板塊: ${listUrl}`);
+    const scrapedArticles = [];
     
     try {
-        const { data } = await axios.get(UDN_NEWS_URL);
+        const { data } = await axios.get(listUrl);
         const $ = cheerio.load(data);
         
         // 經濟日報的列表卡片 class
         const cards = $('li.story-headline-wrapper').toArray();
         
         if (cards.length === 0) {
-            logger.warn(`⚠️ [異常] 抓不到任何 經濟日報 新聞卡片，請檢查 DOM 結構是否改變。`);
-            return;
+            logger.warn(`⚠️ [異常] 抓不到任何 經濟日報 新聞卡片，請檢查 DOM 結構是否改變。網址: ${listUrl}`);
+            return scrapedArticles;
         }
-
-        let newArticleCount = 0;
 
         for (const card of cards) {
             const $card = $(card);
@@ -150,12 +164,10 @@ async function scrapeUdnNews() {
             const $linkEl = $card.find('.story__content a');
             let relativeUrl = $linkEl.attr('href');
             const title = $card.find('h3.story__headline').text().trim();
-            // 抓取摘要
-            const summary = $card.find('p.story__text').text().trim();
 
             if (!relativeUrl || !title) continue;
             
-            // 補全相對路徑 (例如: /money/story/... -> https://money.udn.com/money/story/...)
+            // 補全相對路徑
             const articleUrl = relativeUrl.startsWith('http') ? relativeUrl : BASE_URL + relativeUrl;
 
             // 防呆過濾：只允許 UDN 內部新聞連結
@@ -163,9 +175,9 @@ async function scrapeUdnNews() {
                 continue;
             }
             
-            // 【停止條件】遇到已存入資料庫的文章，代表後續皆為舊聞，跳出掃描
+            // 【停止條件】遇到已存入資料庫的文章，代表後續皆為舊聞，跳出目前這個板塊的掃描
             if (isArticleExists(articleUrl)) {
-                logger.info(`🛑 遇到已存入的新聞，經濟日報 掃描結束。`);
+                logger.info(`🛑 [Extract] 遇到已存在 DB 的舊新聞，停止本板塊掃描。`);
                 break; 
             }
 
@@ -178,43 +190,62 @@ async function scrapeUdnNews() {
                 return s;
             });
 
-            logger.info(`📥 [UDN] 處理中: [${title}]`);
-            logger.info(`   🏷️ 萃取代號: ${displaySymbols.length > 0 ? displaySymbols.join(', ') : '無'}`);
+            logger.info(`📥 [Extract] UDN 萃取成功: [${title}]`);
+            logger.info(`   🏷️ 關聯代號: ${displaySymbols.length > 0 ? displaySymbols.join(', ') : '無'}`);
 
             if (!content || content.length === 0) {
                 logger.warn(`⚠️ [異常] 抓取到空內文 (可能是會員付費文章或特殊排版): ${articleUrl}`);
             }
 
-            // 存入共用的資料庫模組
-            saveNewsWithTags({
+            // 將資料推入陣列交接給 Scheduler
+            scrapedArticles.push({
                 url: articleUrl,
                 title: title,
-                summary: summary,
-                content: content
-            }, symbols);
-
-            newArticleCount++;
+                content: content,
+                symbols: symbols
+            });
             
-            // 防禦性延遲 (隨機 1~3 秒)，避免被當成惡意攻擊阻擋
+            // 防禦性延遲 (隨機 1~3 秒)
             await new Promise(res => setTimeout(res, 1000 + Math.random() * 2000));
         }
 
-        logger.info(`✅ 經濟日報 掃描完畢，共新增 ${newArticleCount} 篇新聞。`);
+        logger.info(`✅ [Extract] 經濟日報 本板塊掃描完畢，共萃取 ${scrapedArticles.length} 篇新新聞。`);
 
     } catch (error) {
-        logger.error(`❌ 經濟日報 掃描發生錯誤 | 錯誤: ${error.message}`);
+        logger.error(`❌ [Extract] 經濟日報 掃描發生錯誤 | 錯誤: ${error.message}`);
     }
+
+    return scrapedArticles;
 }
 
-async function startUdnScraper() {
+/**
+ * 爬蟲主程式 (供 Scheduler 呼叫)
+ * @returns {Array} 包含所有新爬取文章的陣列
+ */
+async function scrape() {
     logger.info('==================================================');
-    logger.info('🚀 經濟日報 爬蟲啟動 (搭載名稱智能反查系統)');
+    logger.info('🚀 經濟日報 爬蟲啟動 (啟動 ETL Extract 階段 - 多板塊)');
     logger.info('==================================================');
 
-    await scrapeUdnNews();
+    let allNewArticles = [];
 
-    logger.info('🏁 經濟日報 爬取完畢！');
+    // 依序掃描陣列中的每個目標網址
+    for (const url of TARGET_URLS) {
+        const articles = await scrapeCategory(url);
+        
+        // 如果有抓到新文章，就合併進總陣列
+        if (articles && articles.length > 0) {
+            allNewArticles = allNewArticles.concat(articles);
+        }
+        
+        // 切換板塊時休息 2~4 秒，避免被當成攻擊封鎖 IP
+        await new Promise(res => setTimeout(res, 2000 + Math.random() * 2000));
+    }
+
+    logger.info(`🏁 [Extract] 經濟日報 全板塊爬取完畢！共將交接 ${allNewArticles.length} 篇原始新聞給 AI 進行 Q4 濃縮。`);
+    
+    return allNewArticles;
 }
 
-// 執行
-startUdnScraper();
+// 匯出 scrape 函數給 scheduler 統一調度
+module.exports = { scrape };
