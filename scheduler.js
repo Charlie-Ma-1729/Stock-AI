@@ -65,8 +65,8 @@ async function triggerReport(reportName, requiresInstitutionalData = false) {
 // 🕒 排程設定區 (使用 node-cron)
 // ==========================================
 
-// 🔄 爬蟲：每小時的 15 分和 45 分
-cron.schedule('15,45 * * * *', runScrapers, { timezone: "Asia/Taipei" });
+// 🔄 爬蟲：每小時的 0 分, 15 分, 30 分 和 45 分
+cron.schedule('0,15,30,45 * * * *', runScrapers, { timezone: "Asia/Taipei" });
 
 // 📝 06:00 美股收盤與晨間風向
 cron.schedule('0 6 * * 2-6', () => triggerReport('06:00 美股收盤與晨間風向'), { timezone: "Asia/Taipei" });
