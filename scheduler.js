@@ -15,9 +15,9 @@ function runScrapers() {
     //     return;
     // }
     logger.info('🕷️ 啟動例行性爬蟲任務...');
-    exec('node scrapers/cmoney_scraper.js', (err) => { if (err) logger.error(err.message); });
-    exec('node scrapers/ctee_scraper.js', (err) => { if (err) logger.error(err.message); });
-    exec('node scrapers/udn_scraper.js', (err) => { if (err) logger.error(err.message); });
+    exec('node ./cmoney_scraper.js', (err) => { if (err) logger.error(err.message); });
+    exec('node ./scrapers/ctee_scraper.js', (err) => { if (err) logger.error(err.message); });
+    exec('node ./scrapers/udn_scraper.js', (err) => { if (err) logger.error(err.message); });
 }
 
 /**
