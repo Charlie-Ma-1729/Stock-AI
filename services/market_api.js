@@ -1,20 +1,27 @@
-const yahooFinance = require('yahoo-finance2').default;
+// market_api.js
+// ==========================================================================
+// 🌟 [修復]: 依照 v2 最新規範執行實例化，並傳入 suppressNotices 徹底壓制問卷提示
+// ==========================================================================
+const YahooFinance = require('yahoo-finance2').default || require('yahoo-finance2');
+const yahooFinance = new YahooFinance({
+    suppressNotices: ['yahooSurvey'] // 👈 完美修復並隱藏終端機的煩人調查提示
+}); 
+
 const axios = require('axios');
 const logger = require('../logger');
 
-// === 核心修正：正確實例化 ===
-const yf = new yahooFinance({ suppressNotices: ['yahooSurvey'] });
-
-// ==========================================
-// 🇺🇸 模組 1：Yahoo Finance (保持原樣)
-// ==========================================
+/**
+ * 🇺🇸 模組 1：Yahoo Finance (全球宏觀指數)
+ * 抓取台美股重要指數、權值股 ADR，用以輔助大腦研判全球大局情緒與泡沫化跡象
+ */
 async function getGlobalIndices() {
-    logger.info('📊 [Market API] 正在獲取全球重要指數與 ADR...');
+    logger.info('📊 [Market API] 🌐 正在獲取全球重要指數與 ADR...');
     const symbols = ['^TWII', '^DJI', '^IXIC', '^SOX', 'TSM', 'NVDA'];
     const results = {};
+    const startTime = Date.now();
     try {
         for (const sym of symbols) {
-            const quote = await yf.quote(sym);
+            const quote = await yahooFinance.quote(sym);
             results[sym] = {
                 name: quote.shortName || sym,
                 price: quote.regularMarketPrice,
@@ -23,24 +30,26 @@ async function getGlobalIndices() {
                 marketState: quote.marketState
             };
         }
+        logger.info(`📊 [Market API] ✅ 全球指數獲取完成 (耗時: ${((Date.now() - startTime) / 1000).toFixed(2)}s)`);
         return results;
     } catch (error) {
-        logger.error(`❌ [Market API] Yahoo Finance 錯誤: ${error.message}`);
+        logger.error(`❌ [Market API] 全球指數獲取錯誤: ${error.message}`);
         return null;
     }
 }
 
-// ==========================================
-// 🇹🇼 模組 2：直接抓取 Yahoo Finance 台股資料 (取代 node-twstock)
-// ==========================================
+/**
+ * 🇹🇼 模組 2：直接抓取 Yahoo Finance 台股預設指標即時資料
+ * 提供大盤最核心的三大權值走勢快照
+ */
 async function getTaiwanStocksRealtime(stockIds = ['2330', '2317', '2454']) {
-    logger.info(`📊 [Market API] 正在獲取台股即時報價: ${stockIds.join(', ')}...`);
+    logger.info(`📊 [Market API] 🇹🇼 正在獲取台股預設指標即時報價: [${stockIds.join(', ')}]...`);
     const results = {};
+    const startTime = Date.now();
     try {
         for (const id of stockIds) {
-            // 台股在 Yahoo Finance 的代號需要加上 .TW
             const symbol = `${id}.TW`;
-            const quote = await yf.quote(symbol);
+            const quote = await yahooFinance.quote(symbol);
             results[id] = {
                 name: quote.shortName || id,
                 price: quote.regularMarketPrice,
@@ -49,6 +58,7 @@ async function getTaiwanStocksRealtime(stockIds = ['2330', '2317', '2454']) {
                 time: new Date().toLocaleTimeString()
             };
         }
+        logger.info(`📊 [Market API] ✅ 台股指標獲取完成 (耗時: ${((Date.now() - startTime) / 1000).toFixed(2)}s)`);
         return results;
     } catch (error) {
         logger.error(`❌ [Market API] 台股即時報價失敗: ${error.message}`);
@@ -56,17 +66,23 @@ async function getTaiwanStocksRealtime(stockIds = ['2330', '2317', '2454']) {
     }
 }
 
-// ==========================================
-// 🏦 模組 3：證交所 OpenAPI
-// ==========================================
+/**
+ * 🏦 模組 3：證交所 OpenAPI (三大法人買賣超)
+ * 用於盤後推理主力與散戶對做、利多出盡或主力鎖碼的底層數據
+ */
 async function getInstitutionalInvestors() {
-    logger.info('📊 [Market API] 正在獲取台股三大法人買賣超數據...');
+    logger.info('📊 [Market API] 🏦 正在向證交所請求三大法人數據...');
     try {
         const response = await axios.get('https://www.twse.com.tw/fund/BFI82U?response=json', {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            timeout: 5000 
         });
         const data = response.data;
-        if (data.stat !== 'OK') return '今日三大法人數據尚未公布。';
+        if (data.stat !== 'OK') {
+            logger.warn('⚠️ [Market API] 證交所回傳格式不符或今日尚未公布數據。');
+            return '今日三大法人數據尚未公布。';
+        }
+        logger.info('📊 [Market API] ✅ 三大法人數據獲取成功。');
         return data.data.map(row => `${row[0]}: 買賣超 ${row[3]} 元`).join(' | ');
     } catch (error) {
         logger.error(`❌ [Market API] 獲取三大法人失敗: ${error.message}`);
@@ -74,10 +90,73 @@ async function getInstitutionalInvestors() {
     }
 }
 
-// ==========================================
-// 🚀 統整輸出
-// ==========================================
+/**
+ * 🎯 模組 4：動態標的數據查詢 (AI 精選個股後，專用精準查詢版)
+ * 為 AI 預留買賣超前 15 名主力分點與地緣分點追蹤結構
+ */
+async function fetchTargetsData(targets, symbols) {
+    if (!symbols || !Array.isArray(symbols) || symbols.length === 0) {
+        logger.warn('⚠️ [Market API] 收到空代號陣列，跳過動態數據抓取。');
+        return {};
+    }
+
+    logger.info(`🎯 [Market API] 📥 接收到精準代號抓取請求，共 ${symbols.length} 筆: [${symbols.join(', ')}]`);
+    const results = {};
+    const startTime = Date.now();
+    let successCount = 0;
+    
+    for (let i = 0; i < symbols.length; i++) {
+        const symbol = symbols[i];
+        const targetName = targets[i] || symbol;
+        
+        logger.info(`  🔍 [查詢中] 正在獲取 ${targetName} (${symbol}) 報價與深度籌碼...`);
+        try {
+            const quote = await yahooFinance.quote(symbol);
+            
+            // 基礎報價與技術指標資料
+            results[targetName] = {
+                symbol: symbol,                                    
+                name: quote.shortName || quote.longName || targetName, 
+                price: quote.regularMarketPrice,                   
+                changePercent: (quote.regularMarketChangePercent || 0).toFixed(2) + '%', 
+                volume: quote.regularMarketVolume,                 
+                peRatio: quote.trailingPE ? quote.trailingPE.toFixed(2) : 'N/A',         
+                fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,          
+                fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
+                
+                // 深度籌碼擴充區預留欄位，未來可對接爬蟲注入
+                chips_analysis: {
+                    top_15_buyers: [
+                        { broker: "地緣主力分點A", volume_buy: "預留欄位", strategy: "波段鎖碼" },
+                        { broker: "外資分點", volume_buy: "預留欄位", strategy: "外資隔日沖" }
+                    ],
+                    top_15_sellers: [
+                        { broker: "主力倒貨分點", volume_sell: "預留欄位", strategy: "短線倒貨" }
+                    ],
+                    summary_status: "籌碼高度集中 / 主力暗中出貨給散戶 / 擦鞋童過熱" 
+                }
+            };
+            logger.info(`  ✅ [成功] ${targetName}: 現價 ${quote.regularMarketPrice} (${results[targetName].changePercent})`);
+            successCount++;
+        } catch (error) {
+            logger.error(`  ❌ [失敗] 無法獲取 ${targetName} (${symbol}) 報價: ${error.message}`);
+            results[targetName] = `獲取失敗: 代號可能有誤或查無資料`;
+        }
+    }
+    
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    logger.info(`🎯 [Market API] 🏁 動態抓取任務結束。成功: ${successCount}/${symbols.length} 筆 (耗時: ${duration}s)`);
+    return results;
+}
+
+/**
+ * 🚀 統整輸出市場快照
+ */
 async function getMarketSnapshot(includeInstitutional = false, includeTwStock = true) {
+    logger.info('==================================================');
+    logger.info('📈 [Market API] 啟動市場快照打包程序...');
+    const snapshotStartTime = Date.now();
+
     const snapshot = {
         timestamp: new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' }),
         global_indices: await getGlobalIndices()
@@ -88,7 +167,10 @@ async function getMarketSnapshot(includeInstitutional = false, includeTwStock = 
     if (includeInstitutional) {
         snapshot.institutional_investors = await getInstitutionalInvestors();
     }
+    
+    logger.info(`📈 [Market API] 📦 市場快照打包完成 (總耗時: ${((Date.now() - snapshotStartTime) / 1000).toFixed(2)}s)`);
+    logger.info('==================================================');
     return snapshot;
 }
 
-module.exports = { getMarketSnapshot };
+module.exports = { getMarketSnapshot, fetchTargetsData };
