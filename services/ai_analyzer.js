@@ -51,15 +51,12 @@ function safeParseJSON(rawResponse) {
 }
 
 // ==========================================
-// 📖 字典載入與後處理機制 (解決代號對不上的問題)
+// 📖 字典載入與後處理機制
 // ==========================================
 const twDictPath = path.join(__dirname, '../tw_stocks.json');
 const usDictPath = path.join(__dirname, '../us_stocks.json');
 let stockDict = {}; // 格式統一為: { "台積電": "2330.TW", "輝達": "NVDA" }
 
-/**
- * 🌟 高兼容性字典解析器：支援陣列與物件等多種常見 JSON 格式
- */
 function parseDictionary(data, suffix = '') {
     if (Array.isArray(data)) {
         data.forEach(item => {
@@ -69,13 +66,12 @@ function parseDictionary(data, suffix = '') {
         });
     } else if (typeof data === 'object') {
         for (const [k, v] of Object.entries(data)) {
-            // 判斷 k 和 v 哪個是代號、哪個是中文名稱 (代號通常是純英數)
             if (/^[A-Za-z0-9]+$/.test(k) && !/^[A-Za-z0-9]+$/.test(v)) {
                 stockDict[v] = suffix ? `${k}${suffix}` : k;
             } else if (!/^[A-Za-z0-9]+$/.test(k) && /^[A-Za-z0-9]+$/.test(v)) {
                 stockDict[k] = suffix ? `${v}${suffix}` : v;
             } else {
-                stockDict[v] = suffix ? `${k}${suffix}` : k; // 預設 k為代號, v為名稱
+                stockDict[v] = suffix ? `${k}${suffix}` : k; 
             }
         }
     }
@@ -85,12 +81,12 @@ function loadDictionaries() {
     try {
         if (fs.existsSync(twDictPath)) {
             const twData = JSON.parse(fs.readFileSync(twDictPath, 'utf-8'));
-            parseDictionary(twData, '.TW'); // 台股強制加 .TW 讓 Yahoo Finance 看得懂
+            parseDictionary(twData, '.TW'); 
             logger.info('📖 [字典系統] 台股字典載入成功');
         }
         if (fs.existsSync(usDictPath)) {
             const usData = JSON.parse(fs.readFileSync(usDictPath, 'utf-8'));
-            parseDictionary(usData, ''); // 美股不加
+            parseDictionary(usData, ''); 
             logger.info('📖 [字典系統] 美股字典載入成功');
         }
     } catch (e) {
@@ -104,16 +100,29 @@ loadDictionaries();
  */
 function mapNameToSymbol(name) {
     if (!name) return null;
-    // 1. 完全比對優先
     if (stockDict[name]) return stockDict[name];
     
-    // 2. 模糊比對防呆機制
     for (const [dictName, symbol] of Object.entries(stockDict)) {
-        // 防呆：字典名稱至少要2個字以上，避免 "大盤" 的 "大" 誤配到 "大立光"
         if (dictName.length >= 2) {
             if (name.includes(dictName) || dictName.includes(name)) {
                 return symbol;
             }
+        }
+    }
+    return null;
+}
+
+/**
+ * 🌟 新增：反向查表 (代號轉回正港中文名)，避免 Yahoo Finance 傳回英文名稱導致對不上新聞
+ */
+function getChineseNameBySymbol(targetSymbol) {
+    if (!targetSymbol) return null;
+    const cleanTarget = targetSymbol.replace(/\.TW|\.TWO/gi, '').toUpperCase();
+    
+    for (const [name, sym] of Object.entries(stockDict)) {
+        const cleanSym = sym.replace(/\.TW|\.TWO/gi, '').toUpperCase();
+        if (cleanSym === cleanTarget) {
+            return name; // 找到正港中文名 (如: 雙鴻)
         }
     }
     return null;
@@ -263,7 +272,6 @@ ${newsCatalog}
 
             const rawResponse = response.data.response;
             
-            // 🌟 導入強健的 JSON 解析器
             let parsedData;
             try {
                 parsedData = safeParseJSON(rawResponse);
@@ -331,19 +339,17 @@ ${newsCatalog}
 }
 
 /**
- * 🌟 實戰報告模板生成器 (包含防幻覺與防呆機制)
+ * 🌟 實戰報告模板生成器
  */
 function buildPrompt(reportType, globalMarketData, specificMarketData, targets, symbols, filteredNews, userQA, pastMemories, duePredictions) {
     const now = new Date();
     const timeString = now.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
     
-    // 🛑 核心修復 1：假日判斷，防呆「成交量為0 = 假多頭」的荒唐邏輯
     const isWeekend = [0, 6].includes(now.getDay());
     const weekendNote = isWeekend 
         ? `\n【⚠️ 假日防呆警報 ⚠️】：今天是週末假日，台股未開盤！因此大盤與個股的「成交量為0」是完全正常的休市狀態。絕對不可將成交量0解讀為「市場低迷」、「假多頭」、「量縮」或「主力出貨」。` 
         : "";
 
-    // 🛑 核心修復 2：建立已經驗證的代號對照表，堵死 AI 通靈代號的空間
     let verifiedMapping = targets.map((t, idx) => `- ${t} (正確代號: ${symbols[idx]})`).join('\n');
     if (!verifiedMapping) verifiedMapping = "無特定標的";
 
@@ -435,7 +441,6 @@ async function generateMarketReport(reportType, globalMarketData = {}, compresse
         if (typeof getDuePredictions === 'function') duePredictions = await getDuePredictions();
     } catch (e) {}
 
-    // 🌟 核心修復：把 symbols 陣列傳遞給 buildPrompt 製作防呆對照表
     logger.info(`[總指揮大腦 - 8B] ⚙️ 正在組合最終看盤 Prompt，準備傳送給 8B 模型...`);
     const finalPrompt = buildPrompt(reportType, globalMarketData, specificMarketData, targets, symbols, filteredNews, userQA, pastMemories, duePredictions);
 
@@ -531,7 +536,6 @@ async function evaluateUserInput(userName, userInput, type) {
 
 /**
  * 🌟 5. 新增：個股即時走勢速評 (走輕量模型，求快)
- * 供 Discord !查 指令專用
  */
 async function quickAnalyzeStock(symbol, stockData) {
     logger.info(`[AI 即時速評 - 3B] ⚡ 啟動 ${symbol} 走勢與新聞關聯分析...`);
@@ -541,13 +545,23 @@ async function quickAnalyzeStock(symbol, stockData) {
     
     const allRecentNews = db.getRecentNews(48);
     const cleanSymbol = symbol.replace(/\.TW|\.TWO/gi, ''); 
+    const chineseName = getChineseNameBySymbol(symbol); // 🌟 核心修復：翻譯出正港中文名
     const stockName = stockData.name || symbol;
 
     const relatedNews = allRecentNews.filter(news => {
-        const matchSymbol = news.symbols && (news.symbols.includes(symbol) || news.symbols.includes(cleanSymbol));
+        // 轉為字串避免 DB 欄位格式錯誤
+        const symbolStr = (news.symbols || news.tags || '').toString();
+        
+        // 條件 1: DB 的 tags/symbols 欄位有命中代號
+        const matchSymbol = symbolStr.includes(cleanSymbol);
+        // 條件 2: 新聞標題或摘要有命中「正港中文名」(防呆 Yahoo 的英文名)
+        const matchChineseName = chineseName && (news.title.includes(chineseName) || (news.summary && news.summary.includes(chineseName)));
+        // 條件 3: 新聞標題或摘要有命中 Yahoo 的名字
         const matchName = stockName && (news.title.includes(stockName) || (news.summary && news.summary.includes(stockName)));
-        const matchCleanName = news.title.includes(cleanSymbol);
-        return matchSymbol || matchName || matchCleanName;
+        // 條件 4: 新聞標題或摘要直接出現純數字代號
+        const matchCleanName = news.title.includes(cleanSymbol) || (news.summary && news.summary.includes(cleanSymbol));
+        
+        return matchSymbol || matchChineseName || matchName || matchCleanName;
     }).slice(0, 5); 
 
     let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
@@ -555,11 +569,11 @@ async function quickAnalyzeStock(symbol, stockData) {
         newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n摘要重點: ${n.summary}`).join('\n\n');
         logger.info(`[AI 即時速評 - 3B] 📰 成功從資料庫撈取 ${relatedNews.length} 篇關聯新聞餵給 AI。`);
     } else {
-        logger.warn(`[AI 即時速評 - 3B] ⚠️ 資料庫內目前找不到 ${stockName} (${symbol}) 的相關新聞。`);
+        logger.warn(`[AI 即時速評 - 3B] ⚠️ 資料庫內目前找不到 ${chineseName || stockName} (${symbol}) 的相關新聞。`);
     }
 
     const prompt = `你是一位專業台美股分析師。請根據以下即時數據、歷史走勢與近期新聞，給出一段簡潔有力的「個股速評」(大約 150-200 字)。
-【標的】：${stockName} (${symbol})
+【標的】：${chineseName || stockName} (${symbol})
 【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
 【月線(20MA)均價】：${stockData.monthlyAvgPrice}
 【本益比】：${stockData.peRatio}
@@ -599,25 +613,27 @@ ${newsContext}
 
 /**
  * 🌟 6. 新增：個股深度詳查報告 (走 8B 重裝模型，求精準與深度)
- * 供 Discord !詳查 指令專用
  */
 async function detailedAnalyzeStock(symbol, stockData) {
     logger.info(`[AI 深度詳查 - 8B] 🧠 啟動 ${symbol} 深度解析...`);
     const startTime = Date.now();
 
-    // 將近 10 日的走勢陣列轉為文字
     const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
     
-    // 擴大撈取範圍 (72小時)
-    const allRecentNews = db.getRecentNews(72);
+    const allRecentNews = db.getRecentNews(72); // 放大新聞時間範圍到 72 小時
     const cleanSymbol = symbol.replace(/\.TW|\.TWO/gi, ''); 
+    const chineseName = getChineseNameBySymbol(symbol); // 🌟 核心修復：翻譯出正港中文名
     const stockName = stockData.name || symbol;
 
     const relatedNews = allRecentNews.filter(news => {
-        const matchSymbol = news.symbols && (news.symbols.includes(symbol) || news.symbols.includes(cleanSymbol));
+        const symbolStr = (news.symbols || news.tags || '').toString();
+        
+        const matchSymbol = symbolStr.includes(cleanSymbol);
+        const matchChineseName = chineseName && (news.title.includes(chineseName) || (news.summary && news.summary.includes(chineseName)));
         const matchName = stockName && (news.title.includes(stockName) || (news.summary && news.summary.includes(stockName)));
-        const matchCleanName = news.title.includes(cleanSymbol);
-        return matchSymbol || matchName || matchCleanName;
+        const matchCleanName = news.title.includes(cleanSymbol) || (news.summary && news.summary.includes(cleanSymbol));
+        
+        return matchSymbol || matchChineseName || matchName || matchCleanName;
     }).slice(0, 10); // 取最多 10 篇新聞供大腦閱讀
 
     let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
@@ -625,11 +641,11 @@ async function detailedAnalyzeStock(symbol, stockData) {
         newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n摘要重點: ${n.summary}`).join('\n\n');
         logger.info(`[AI 深度詳查 - 8B] 📰 成功從資料庫撈取 ${relatedNews.length} 篇關聯新聞餵給 AI。`);
     } else {
-        logger.warn(`[AI 深度詳查 - 8B] ⚠️ 資料庫內目前找不到 ${stockName} (${symbol}) 的相關新聞。`);
+        logger.warn(`[AI 深度詳查 - 8B] ⚠️ 資料庫內目前找不到 ${chineseName || stockName} (${symbol}) 的相關新聞。`);
     }
 
     const prompt = `你是一位深諳反身性與行為金融學的台美股資深操盤手。請根據以下量價數據與近期新聞，為這檔股票寫一份「深度詳查報告」(約 300-500 字)。
-【標的】：${stockName} (${symbol})
+【標的】：${chineseName || stockName} (${symbol})
 【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
 【月線(20MA)均價】：${stockData.monthlyAvgPrice}
 【本益比】：${stockData.peRatio}
@@ -669,5 +685,4 @@ ${newsContext}
     }
 }
 
-// 🌟 核心修復：記得把 detailedAnalyzeStock 導出給 bot.js 使用！
 module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock, detailedAnalyzeStock };
