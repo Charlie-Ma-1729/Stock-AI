@@ -535,7 +535,7 @@ async function evaluateUserInput(userName, userInput, type) {
 }
 
 /**
- * 🌟 5. 新增：個股即時走勢速評 (走輕量模型，求快)
+ * 🌟 5. 個股即時走勢速評 (走輕量模型，求快)
  * 供 Discord !查 指令專用，結合 Market API 回傳之量化數據給出解讀
  */
 async function quickAnalyzeStock(symbol, stockData) {
@@ -581,4 +581,64 @@ ${trendStr}
     }
 }
 
-module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock };
+/**
+ * 🌟 6. 新增：深度個股問答與綜合分析 (走高階模型 8B)
+ * 供 Discord !詳查 指令專用，融合「量化走勢」、「質化新聞」與「使用者具體問題」進行推演
+ */
+async function detailedAnalyzeStock(symbol, stockData, relatedNews, userQuestion) {
+    logger.info(`[AI 深度檢索 - 8B] 🔍 啟動 ${symbol} 深度報告推演...`);
+    const startTime = Date.now();
+
+    // 格式化：近 10 日的走勢
+    const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
+    
+    // 格式化：關聯新聞摘要
+    let newsStr = '無近期相關新聞。';
+    if (relatedNews && relatedNews.length > 0) {
+        newsStr = relatedNews.map((n, i) => `[${i + 1}] ${n.title}\n摘要重點: ${n.summary || n.compressed_summary}`).join('\n\n');
+    }
+
+    const prompt = `你是一位深諳籌碼面與消息面的專業台美股分析師。
+現在有一位投資人針對【${stockData.name || symbol} (${symbol})】提出了具體的疑問：「${userQuestion}」
+
+請綜合以下客觀數據與近期新聞，為他進行客觀、深度的解答。
+
+【量化數據 (基礎面與近期走勢)】：
+- 即時報價：${stockData.currentPrice} (${stockData.changePercent})
+- 月線(20MA)均價：${stockData.monthlyAvgPrice}
+- 本益比(PE)：${stockData.peRatio}
+- 近 10 日走勢：
+${trendStr}
+
+【質化數據 (近期相關新聞，有助於研判消息面與未來題材)】：
+${newsStr}
+
+【強制任務與輸出規範】：
+1. 語系強制：必須且只能使用「繁體中文 (zh-TW)」。
+2. 直接破題：第一段請直接針對他的問題「${userQuestion}」給出明確的見解與答案。
+3. 數據佐證：在論述中，必須引用上方的報價走勢或新聞內容來支持你的論點 (例如：跌破月線代表轉弱、或某篇新聞的題材具備利多)。
+4. 機率與風險思維：分析師絕不給出 100% 穩賺或必跌的建議，必須給出「如果跌破/突破XX價格，代表趨勢反轉」的防守點或風險提示。
+5. 專業排版：可以使用 Markdown 條列式或粗體讓版面易讀，但不要輸出任何前言或結語，直接給出分析正文。`;
+
+    try {
+        const response = await axios.post(OLLAMA_URL, {
+            model: MODEL_8B, // 使用 8B 核心引擎進行複雜推理
+            prompt: prompt, 
+            stream: false, 
+            options: { temperature: 0.3, num_ctx: 4096 } // 給予較大的 context window 以容納多篇新聞
+        }, { timeout: MAX_TIMEOUT_MS }); 
+
+        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+        logger.info(`[AI 深度檢索 - 8B] ✅ 報告推演完成 (耗時: ${duration}s)`);
+        
+        // 組合最終回傳文字，附上整理好的基礎報價與新聞篇數
+        const baseInfo = `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent}) ｜ **📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n**📰 關聯新聞情報**：參考了近 ${relatedNews.length} 篇相關文章\n\n`;
+        return baseInfo + response.data.response.trim();
+
+    } catch (error) {
+        logger.error(`[AI 深度檢索 - 8B] ❌ 報告推演失敗: ${error.message}`);
+        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n\n⚠️ 系統提示：AI 深度推演模組暫時離線或處理超時，無法完成您的問題：「${userQuestion}」。`;
+    }
+}
+
+module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock, detailedAnalyzeStock };

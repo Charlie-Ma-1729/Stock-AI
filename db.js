@@ -1,3 +1,4 @@
+// db.js
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
@@ -80,6 +81,7 @@ const stmts = {
     // 現在存入 DB 時，summary 裝的會是 AI 已經濃縮好的精華，content 直接放空字串即可
     insertArticle: db.prepare(`INSERT OR IGNORE INTO articles (url, title, summary, content) VALUES (?, ?, ?, ?)`),
     insertStockMap: db.prepare(`INSERT OR IGNORE INTO stock_news_map (symbol, article_url) VALUES (?, ?)`),
+    
     getRecentNews: db.prepare(`
         SELECT a.url, a.title, a.summary, a.content, GROUP_CONCAT(m.symbol) as symbols
         FROM articles a
@@ -87,10 +89,28 @@ const stmts = {
         WHERE a.published_at >= datetime('now', '-' || ? || ' hours')
         GROUP BY a.url
     `),
-    // 新增：刪除 36 小時以前的新聞主檔
-    deleteOldArticles: db.prepare(`DELETE FROM articles WHERE published_at < datetime('now', '-36 hours')`),
-    // 新增：清除沒有對應新聞的孤兒映射 (安全機制)
-    deleteOrphanMaps: db.prepare(`DELETE FROM stock_news_map WHERE article_url NOT IN (SELECT url FROM articles)`)
+    
+    // 🌟 [新增]: 給詳查指令用的深度檢索 SQL (包含關聯代號與標題、摘要的模糊比對)
+    searchNewsByKeyword: db.prepare(`
+        SELECT a.url, a.title, a.summary, a.content, GROUP_CONCAT(m.symbol) as symbols
+        FROM articles a
+        LEFT JOIN stock_news_map m ON a.url = m.article_url
+        WHERE m.symbol = ? 
+           OR a.title LIKE ? OR a.summary LIKE ? 
+           OR a.title LIKE ? OR a.summary LIKE ?
+        GROUP BY a.url
+        ORDER BY a.published_at DESC
+        LIMIT ?
+    `),
+    
+    // [優化]: 修改成動態吃參數的小時數，配合排程器的 15 小時
+    deleteOldArticles: db.prepare(`DELETE FROM articles WHERE published_at < datetime('now', '-' || ? || ' hours')`),
+    deleteOrphanMaps: db.prepare(`DELETE FROM stock_news_map WHERE article_url NOT IN (SELECT url FROM articles)`),
+
+    // 🌟 [修復]: 補齊漏掉的預言系統 SQL 語法
+    insertPrediction: db.prepare(`INSERT INTO predictions (source, symbol, prediction_text, created_at, target_date) VALUES (?, ?, ?, ?, ?)`),
+    getPendingPredictions: db.prepare(`SELECT * FROM predictions WHERE status = 'PENDING' AND target_date <= ?`),
+    updatePredictionStatus: db.prepare(`UPDATE predictions SET status = 'EVALUATED' WHERE id = ?`)
 };
 
 function isArticleExists(url) {
@@ -117,14 +137,45 @@ function getRecentNews(hours = 12) {
 }
 
 /**
- * [新增功能] 清理 36 小時前的老舊新聞，維持系統輕量化
+ * 🌟 [新增功能] 針對個股的專屬新聞檢索
+ * @param {string} stockName 股票名稱 (例如: 台積電)
+ * @param {string} symbol 股票代號 (例如: 2330.TW 或 NVDA)
+ * @param {number} limit 抓取上限
  */
-function cleanOldNews() {
+function searchNewsByKeyword(stockName, symbol, limit = 15) {
+    // 把 .TW 或 .TWO 拔掉，因為新聞常常只會寫純數字 2330
+    const baseSymbol = symbol ? symbol.split('.')[0] : '';
+    
+    const namePattern = stockName ? `%${stockName}%` : '%未提供%';
+    const symbolPattern = baseSymbol ? `%${baseSymbol}%` : '%未提供%';
+    
     try {
-        const info1 = stmts.deleteOldArticles.run();
+        const rows = stmts.searchNewsByKeyword.all(
+            symbol, 
+            namePattern, namePattern,  // 比對標題與摘要是否含名稱
+            symbolPattern, symbolPattern, // 比對標題與摘要是否含代號
+            limit
+        );
+        
+        return rows.map(row => ({
+            ...row,
+            symbols: row.symbols ? row.symbols.split(',') : []
+        }));
+    } catch (err) {
+        logger.error(`❌ [DB] 檢索專屬新聞失敗: ${err.message}`);
+        return [];
+    }
+}
+
+/**
+ * 🧹 [優化功能] 清理老舊新聞，維持系統輕量化 (預設改為 15 小時)
+ */
+function cleanOldNews(hours = 15) {
+    try {
+        const info1 = stmts.deleteOldArticles.run(hours);
         const info2 = stmts.deleteOrphanMaps.run();
         if (info1.changes > 0 || info2.changes > 0) {
-            logger.info(`🗑️ [DB] 自動清理完成：已刪除 ${info1.changes} 篇過期(36小時前)新聞，及 ${info2.changes} 筆無效標籤。`);
+            logger.info(`🗑️ [DB] 自動清理完成：已刪除 ${info1.changes} 篇過期(${hours}小時前)新聞，及 ${info2.changes} 筆無效標籤。`);
         }
     } catch (err) {
         logger.error(`❌ [DB] 清理舊新聞失敗: ${err.message}`);
@@ -197,7 +248,8 @@ module.exports = {
     isArticleExists,
     saveNewsWithTags,
     getRecentNews,
-    cleanOldNews, // 將新功能匯出，讓 Scheduler 可以定期呼叫
+    searchNewsByKeyword, // 🌟 匯出供 bot.js 呼叫
+    cleanOldNews, 
     savePrediction,
     getDuePredictions,
     markPredictionEvaluated,

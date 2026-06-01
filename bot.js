@@ -64,7 +64,6 @@ client.on('messageCreate', async (message) => {
             }
 
             // 🛠️ 核心修復：加上第 4 個參數 'question'，解決 AI 報告漏答的問題
-            // (後續 ai_analyzer.js 也會配合此參數寫入 JSON 的 type 欄位)
             ai_analyzer.addPendingQA(message.author.username, question, '', 'question');
             await message.reply('✅ 你的問題已經收錄，AI 將在下一份定時報告的 QA 環節為你客觀解答！');
         }
@@ -137,7 +136,7 @@ client.on('messageCreate', async (message) => {
         // --------------------------------------------------
         // 功能五：🌟 個股即時查價與 AI 走勢速評 (!查)
         // --------------------------------------------------
-        else if (content.startsWith('!查')) {
+        else if (content.startsWith('!查') && !content.startsWith('!詳查')) {
             // 支援 "!查2330" 或 "!查 NVDA" 格式，去除指令並轉大寫
             const symbol = content.replace('!查', '').trim().toUpperCase();
             
@@ -152,14 +151,14 @@ client.on('messageCreate', async (message) => {
                 // 載入 market_api 模組
                 const marketApi = require('./services/market_api');
                 
-                // 呼叫市場 API 抓取個股走勢與報價資料 (預留介面：fetchStockTrend)
+                // 呼叫市場 API 抓取個股走勢與報價資料
                 const stockData = await marketApi.fetchStockTrend(symbol);
                 
                 if (!stockData || stockData.error) {
                     return waitMsg.edit(`❌ 查詢失敗：無法獲取 **${symbol}** 的報價與走勢資料。\n(台股請確認代號，美股請確認 Ticker 是否正確)`);
                 }
 
-                // 呼叫 AI 進行輕量快速分析 (預留介面：quickAnalyzeStock)
+                // 呼叫 AI 進行輕量快速分析
                 const analysisResult = await ai_analyzer.quickAnalyzeStock(symbol, stockData);
 
                 // 將最終結果回傳至 Discord
@@ -170,6 +169,70 @@ client.on('messageCreate', async (message) => {
                 await waitMsg.edit(`❌ 系統查詢或分析過程中發生未預期錯誤，請檢查系統後台紀錄。`);
             }
         }
+
+        // --------------------------------------------------
+        // 功能六：🚀 深度查價與新聞綜合分析 (!詳查)
+        // --------------------------------------------------
+        else if (content.startsWith('!詳查')) {
+            // 預期格式: !詳查 2330 什麼時候可能要注意退場
+            const inputStr = content.replace('!詳查', '').trim();
+            const firstSpaceIndex = inputStr.indexOf(' ');
+            
+            if (firstSpaceIndex === -1) {
+                return message.reply('⚠️ 格式錯誤！請輸入「代號」與「你想問的問題」，例如：`!詳查 2330 什麼時候可能要注意退場`');
+            }
+
+            const rawSymbol = inputStr.substring(0, firstSpaceIndex).trim().toUpperCase();
+            const userQuestion = inputStr.substring(firstSpaceIndex + 1).trim();
+
+            if (!rawSymbol || !userQuestion) {
+                return message.reply('⚠️ 代號或問題不能為空，例如：`!詳查 NVDA 可以買嗎`');
+            }
+
+            const waitMsg = await message.reply(`⏳ **【深度檢索啟動】**\n1️⃣ 正在獲取 **${rawSymbol}** 即時報價與走勢...\n2️⃣ 正在資料庫調閱關聯新聞...\n3️⃣ 即將交由高階大腦 (8B) 進行推理，大約需時 1~2 分鐘，請稍候...`);
+            
+            try {
+                const marketApi = require('./services/market_api');
+                
+                // 1. 抓取量化走勢資料 (這跟!查一樣，能拿到現價與20MA)
+                const stockData = await marketApi.fetchStockTrend(rawSymbol);
+                
+                if (!stockData || stockData.error) {
+                    return waitMsg.edit(`❌ 查詢失敗：無法獲取 **${rawSymbol}** 的報價與走勢資料，請確認代號是否正確。`);
+                }
+
+                const correctSymbol = stockData.symbol; // 取得校正後的代號 (例如 2330 -> 2330.TW)
+                
+                // 2. 抓取關聯新聞 (預留給 db.js 的新函式)
+                let relatedNews = [];
+                if (typeof db.searchNewsByKeyword === 'function') {
+                    // 同時用股票名稱跟代號去資料庫裡面掃描近期新聞
+                    relatedNews = db.searchNewsByKeyword(stockData.name, correctSymbol, 15); // 最多取 15 篇
+                }
+
+                // 3. 呼叫 AI 進行高階深度分析 (預留給 ai_analyzer 的新函式)
+                const analysisResult = await ai_analyzer.detailedAnalyzeStock(correctSymbol, stockData, relatedNews, userQuestion);
+
+                // 將最終結果回傳至 Discord
+                const finalMessage = `🎯 **【${stockData.name} (${correctSymbol})】AI 深度診斷報告**\n💬 **你的提問**：_${userQuestion}_\n\n${analysisResult}`;
+                
+                // 防呆機制：Discord 訊息字數上限 2000
+                if (finalMessage.length > 1900) {
+                    await waitMsg.edit(`🎯 **【${stockData.name} (${correctSymbol})】AI 深度診斷報告**\n💬 **你的提問**：_${userQuestion}_\n\n(報告生成完畢，長度較長，正在分段傳送...)`);
+                    const chunks = finalMessage.match(/[\s\S]{1,1900}/g) || [];
+                    for (const chunk of chunks) {
+                        await message.channel.send(chunk);
+                    }
+                } else {
+                    await waitMsg.edit(finalMessage);
+                }
+
+            } catch (err) {
+                logger.error(`❌ [Discord Bot] 詳查指令 (!詳查 ${rawSymbol}) 失敗: ${err.message}`);
+                await waitMsg.edit(`❌ 系統分析過程中發生未預期錯誤，請檢查系統後台紀錄。`);
+            }
+        }
+
     } catch (error) {
         // 全域捕捉指令錯誤，避免掛掉
         logger.error(`❌ 處理 Discord 訊息時發生未預期錯誤: ${error.message}`);
