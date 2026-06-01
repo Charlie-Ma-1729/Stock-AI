@@ -566,7 +566,7 @@ ${trendStr}
             prompt: prompt, 
             stream: false, 
             options: { temperature: 0.2, num_ctx: 1024 }
-        }, { timeout: 60000 }); // 1 分鐘超時保護
+        }, { timeout: MAX_TIMEOUT_MS }); // 🌟 改用 MAX_TIMEOUT_MS 防範本機模型載入過慢
 
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
         logger.info(`[AI 即時速評 - 3B] ✅ 速評完成 (耗時: ${duration}s)`);
