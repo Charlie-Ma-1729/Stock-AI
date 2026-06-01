@@ -11,10 +11,13 @@ try {
 }
 
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/generate';
-const MODEL_NAME = 'hf.co/Qwen/Qwen3-4B-GGUF:Q8_0';
+const MODEL_NAME = 'hf.co/lianghsun/Llama-3.2-Taiwan-3B-Instruct-GGUF:Q8_0';
 
 async function evaluatePrediction(prediction) {
     logger.info(`🦉 正在對預言 [ID: ${prediction.id} - ${prediction.symbol}] 進行開獎與覆盤...`);
+    
+    // 取得當前時間，賦予 AI 時間概念
+    const timeString = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
 
     let stockData = {};
     let trendStr = '無法取得即時走勢';
@@ -32,14 +35,16 @@ async function evaluatePrediction(prediction) {
     const symbolNews = db.searchNewsByKeyword('', prediction.symbol, 3);
     let realityContext = '目前資料庫暫無該標的之近期重大新聞。';
     if (symbolNews && symbolNews.length > 0) {
-        // 🌟 核心修改：改用 n.content 而不是 n.summary
-        realityContext = symbolNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n內文: ${n.content}`).join('\n\n');
+        realityContext = symbolNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n時間: ${n.published_at}\n內文: ${n.content}`).join('\n\n');
     }
 
     const prompt = `你是一位嚴格且毒舌的華爾街量化交易檢討員。請對以下「一週前的詳查報告」進行殘酷的「反身性」覆盤：
 
+【當前系統時間】：${timeString} (請以此為基準判斷新聞與價格的時效性)
+
 【一週前的預測紀錄】
 - 標的：${prediction.symbol}
+- 立下預言時間：${prediction.created_at}
 - 當時的預測內容：
 ${prediction.prediction_text}
 
@@ -62,7 +67,7 @@ ${realityContext}
             model: MODEL_NAME,
             prompt: prompt,
             stream: false,
-            options: { temperature: 0.6, num_ctx: 8192 } // 🌟 放大 3B 覆盤模型的記憶體，容納完整新聞內文
+            options: { temperature: 0.6, num_ctx: 8192 } 
         }, { timeout: 1800000 }); 
 
         const lessonText = response.data.response.trim();

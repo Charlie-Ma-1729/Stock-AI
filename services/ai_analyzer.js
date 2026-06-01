@@ -82,6 +82,20 @@ function loadDictionaries() {
 }
 loadDictionaries();
 
+function mapNameToSymbol(name) {
+    if (!name) return null;
+    if (stockDict[name]) return stockDict[name];
+    
+    for (const [dictName, symbol] of Object.entries(stockDict)) {
+        if (dictName.length >= 2) {
+            if (name.includes(dictName) || dictName.includes(name)) {
+                return symbol;
+            }
+        }
+    }
+    return null;
+}
+
 function getChineseNameBySymbol(targetSymbol) {
     if (!targetSymbol) return null;
     const cleanTarget = targetSymbol.replace(/\.TW|\.TWO/gi, '').toUpperCase();
@@ -107,7 +121,6 @@ function addPendingQA(user, question, evaluation = '', type = 'question') {
 
 /**
  * 🌟 RAG 智能觀點探討 (!觀點)
- * 會抓取使用者敘述的關鍵字去找新聞，並結合報價一起回應。
  */
 async function evaluateUserInput(userName, userInput, type) {
     if (type !== 'viewpoint') return '';
@@ -115,8 +128,10 @@ async function evaluateUserInput(userName, userInput, type) {
     logger.info(`[AI 觀點探索 - 8B] 🕵️ 正在解析散戶 (${userName}) 的發言意圖...`);
     const startTime = Date.now();
     
+    // 取得當前時間，賦予 AI 時間概念
+    const timeString = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
+    
     try {
-        // 階段 1：萃取關鍵字
         const extractPrompt = `請從以下用戶發言中，萃取出 2~4 個最重要的「實體名詞」或「事件關鍵字」（例如人名、公司名、產品名、事件）。
 用戶發言：「${userInput}」
 你現在是一台嚴格的 JSON 生成器，只能輸出符合以下格式的純 JSON：
@@ -138,29 +153,28 @@ async function evaluateUserInput(userName, userInput, type) {
 
         logger.info(`[AI 觀點探索 - 8B] 🔍 萃取關鍵字: [${keywords.join(', ')}]，準備檢索新聞庫...`);
 
-        // 階段 2：資料庫新聞檢索與代號提取
         let relatedNews = [];
         let uniqueSymbols = new Set();
         if (keywords.length > 0) {
-            relatedNews = db.searchNewsByGeneralKeywords(keywords, 5); // 抓 5 篇相關新聞
+            relatedNews = db.searchNewsByGeneralKeywords(keywords, 5); 
             relatedNews.forEach(n => {
                 if (n.symbols) n.symbols.forEach(s => uniqueSymbols.add(s));
             });
         }
 
-        // 階段 3：獲取關聯標的之即時報價
         let marketDataStr = '目前無特定關聯的股票報價。';
-        const symbolsArr = Array.from(uniqueSymbols).slice(0, 5); // 最多查 5 檔
+        const symbolsArr = Array.from(uniqueSymbols).slice(0, 5); 
         if (symbolsArr.length > 0 && marketApi) {
             const quotes = await marketApi.fetchTargetsData(symbolsArr, symbolsArr);
             marketDataStr = Object.values(quotes).map(q => typeof q === 'string' ? q : `- ${q.name}(${q.symbol}): 現價 ${q.price} (${q.changePercent})`).join('\n');
             logger.info(`[AI 觀點探索 - 8B] 📈 成功獲取關聯標的報價: ${symbolsArr.join(', ')}`);
         }
 
-        // 階段 4：綜合回答
-        const newsStr = relatedNews.length > 0 ? relatedNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n內文: ${n.content.substring(0, 300)}...`).join('\n\n') : '無相關新聞。';
+        const newsStr = relatedNews.length > 0 ? relatedNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n時間: ${n.published_at}\n內文: ${n.content.substring(0, 300)}...`).join('\n\n') : '無相關新聞。';
 
         const evalPrompt = `你是一位專業且具備反身性思考的台美股分析師。
+【當前系統時間】：${timeString} (請以此為基準判斷新聞與價格的時效性)
+
 用戶（${userName}）發表了以下觀點或提問：「${userInput}」
 
 我們從系統資料庫中，透過關鍵字 [${keywords.join(', ')}] 找到了以下關聯資訊：
@@ -197,9 +211,15 @@ ${marketDataStr}
     }
 }
 
+/**
+ * 🌟 個股即時走勢速評 (!查)
+ */
 async function quickAnalyzeStock(symbol, stockData) {
     logger.info(`[AI 即時速評 - 3B] ⚡ 啟動 ${symbol} 走勢與新聞關聯分析...`);
     const startTime = Date.now();
+    
+    // 取得當前時間
+    const timeString = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
 
     const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
     const allRecentNews = db.getRecentNews(48);
@@ -218,10 +238,11 @@ async function quickAnalyzeStock(symbol, stockData) {
 
     let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
     if (relatedNews.length > 0) {
-        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n內文: ${n.content.substring(0, 500)}...`).join('\n\n');
+        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n時間: ${n.published_at}\n內文: ${n.content.substring(0, 500)}...`).join('\n\n');
     }
 
     const prompt = `你是一位專業台美股分析師。請根據以下即時數據、歷史走勢與近期新聞，給出一段簡潔有力的「個股速評」(大約 150-200 字)。
+【當前系統時間】：${timeString} (請以此為基準判斷新聞與價格的時效性)
 【標的】：${chineseName || stockName} (${symbol})
 【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
 【月線(20MA)均價】：${stockData.monthlyAvgPrice}
@@ -253,16 +274,19 @@ ${newsContext}
 
     } catch (error) {
         logger.error(`[AI 即時速評 - 3B] ❌ 速評失敗: ${error.message}`);
-        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n\n⚠️ 系統提示：AI 走勢解讀模組暫時離線或回應超時。`;
+        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n\n⚠️ 系統提示：AI 走勢解讀模組暫時離線或回應超時。`;
     }
 }
 
 /**
- * 🌟 深度詳查報告 (!詳查) - 支援回答使用者提問
+ * 🌟 深度詳查報告 (!詳查)
  */
 async function detailedAnalyzeStock(symbol, stockData, userInput = '') {
     logger.info(`[AI 深度詳查 - 8B] 🧠 啟動 ${symbol} 深度解析... (附帶用戶提問: ${userInput})`);
     const startTime = Date.now();
+    
+    // 取得當前時間
+    const timeString = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
 
     const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
     
@@ -282,16 +306,16 @@ async function detailedAnalyzeStock(symbol, stockData, userInput = '') {
 
     let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
     if (relatedNews.length > 0) {
-        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n內文: ${n.content}`).join('\n\n');
+        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n時間: ${n.published_at}\n內文: ${n.content}`).join('\n\n');
     }
 
-    // 🌟 核心修改：把使用者的問題強制置入 Prompt
     let userContextPrompt = '';
     if (userInput) {
         userContextPrompt = `\n【使用者的疑問 / 觀點陳述】：\n「${userInput}」\n\n`;
     }
 
     const prompt = `你是一位深諳反身性與行為金融學的台美股資深操盤手。請根據以下量價數據與近期新聞，為這檔股票寫一份「深度詳查報告」(約 400-500 字)。
+【當前系統時間】：${timeString} (請以此為基準判斷新聞與價格的時效性)
 【標的】：${chineseName || stockName} (${symbol})
 【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
 【月線(20MA)均價】：${stockData.monthlyAvgPrice}
