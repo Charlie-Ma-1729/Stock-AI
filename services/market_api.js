@@ -166,8 +166,11 @@ async function fetchStockTrend(rawSymbol) {
         const quote = await yahooFinance.quote(symbol);
         
         // 2. 抓取歷史走勢 (近 30 天)
-        const period1 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); 
-        const historical = await yahooFinance.historical(symbol, { period1 });
+        // 🌟 核心修復：強制轉成 YYYY-MM-DD 字串，並明確給定 period2 (今天)，避免驗證錯誤
+        const period1 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const period2 = new Date().toISOString().split('T')[0]; 
+        
+        const historical = await yahooFinance.historical(symbol, { period1, period2 });
         
         // 3. 整理近期的收盤價走勢 (提取近 10 個交易日供 AI 速評)
         const recentTrend = historical.slice(-10).map(day => ({
