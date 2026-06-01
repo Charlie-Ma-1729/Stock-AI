@@ -27,7 +27,7 @@ function parseDictionary(data) {
             if (sym && name) {
                 // 移除原有的 .TW 或 .TWO，保留純代號
                 const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
-                stockLookupMap[name] = cleanSym; 
+                stockLookupMap[name.toString().trim()] = cleanSym; 
             }
         });
     } else if (typeof data === 'object') {
@@ -40,7 +40,7 @@ function parseDictionary(data) {
                 sym = v; name = k; // 預設 k 是中文
             }
             const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
-            stockLookupMap[name] = cleanSym;
+            stockLookupMap[name.toString().trim()] = cleanSym;
         }
     }
 }
@@ -48,7 +48,7 @@ function parseDictionary(data) {
 try {
     if (fs.existsSync(twDictPath)) parseDictionary(JSON.parse(fs.readFileSync(twDictPath, 'utf-8')));
     if (fs.existsSync(usDictPath)) parseDictionary(JSON.parse(fs.readFileSync(usDictPath, 'utf-8')));
-    logger.info('📖 [Market API] 字典載入成功，已啟用「股票名稱反查代號」功能。');
+    logger.info('📖 [Market API] 字典載入成功，已啟用「中文名稱反查代號」機制。');
 } catch (e) {
     logger.error(`❌ [Market API] 字典載入失敗: ${e.message}`);
 }
@@ -132,7 +132,6 @@ async function getInstitutionalInvestors() {
 
 /**
  * 🎯 模組 4：動態標的數據查詢 (供 AI 大報告使用)
- * 🌟 已加入上櫃股票 (.TWO) 的自動重試防護
  */
 async function fetchTargetsData(targets, symbols) {
     if (!symbols || !Array.isArray(symbols) || symbols.length === 0) {
@@ -166,7 +165,6 @@ async function fetchTargetsData(targets, symbols) {
                 }
             }
             
-            // 基礎報價與技術指標資料
             results[targetName] = {
                 symbol: symbol,                                    
                 name: quote.shortName || quote.longName || targetName, 
@@ -176,16 +174,10 @@ async function fetchTargetsData(targets, symbols) {
                 peRatio: quote.trailingPE ? quote.trailingPE.toFixed(2) : 'N/A',         
                 fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,          
                 fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
-                
                 chips_analysis: {
-                    top_15_buyers: [
-                        { broker: "地緣主力分點A", volume_buy: "預留欄位", strategy: "波段鎖碼" },
-                        { broker: "外資分點", volume_buy: "預留欄位", strategy: "外資隔日沖" }
-                    ],
-                    top_15_sellers: [
-                        { broker: "主力倒貨分點", volume_sell: "預留欄位", strategy: "短線倒貨" }
-                    ],
-                    summary_status: "籌碼高度集中 / 主力暗中出貨給散戶 / 擦鞋童過熱" 
+                    top_15_buyers: [],
+                    top_15_sellers: [],
+                    summary_status: "無" 
                 }
             };
             logger.info(`  ✅ [成功] ${targetName}: 現價 ${quote.regularMarketPrice} (${results[targetName].changePercent})`);
@@ -203,14 +195,14 @@ async function fetchTargetsData(targets, symbols) {
 
 /**
  * 📈 模組 5：個股即時走勢與報價速查 (供 Discord !查 指令使用)
- * 🌟 內建名稱轉代號字典查表、以及上市/上櫃 (.TW / .TWO) 自動切換機制
+ * 🌟 內建名稱轉代號字典查表、以及強化的上市/上櫃 (.TW / .TWO) 自動切換機制
  */
 async function fetchStockTrend(rawInput) {
     let input = rawInput.trim();
     
     // 1. 字典反查：如果你輸入「雙鴻」，這裡會直接幫你轉成「3324」
     if (stockLookupMap[input]) {
-        logger.info(`📖 [Market API] 觸發字典轉換: "${input}" -> "${stockLookupMap[input]}"`);
+        logger.info(`📖 [Market API] 觸發字典轉換: "${input}" -> 代號 "${stockLookupMap[input]}"`);
         input = stockLookupMap[input];
     }
     
@@ -224,44 +216,39 @@ async function fetchStockTrend(rawInput) {
         symbol = `${symbol}.TW`; // 預設給予上市後綴 (.TW)
     }
 
-    logger.info(`🔍 [Market API] 啟動即時查價，最終解析標的: ${symbol}...`);
-    try {
-        // 3. 獲取即時報價，並處理上櫃 (OTC) 股票的 Fallback
-        let quote;
-        try {
-            quote = await yahooFinance.quote(symbol);
-        } catch (err) {
-            if (isTaiwan && symbol.endsWith('.TW') && err.message.includes('No data found')) {
-                logger.warn(`⚠️ 查無 ${symbol}，確認是否為上櫃股票，自動嘗試 ${baseCode}.TWO ...`);
-                symbol = `${baseCode}.TWO`;
-                quote = await yahooFinance.quote(symbol);
-            } else {
-                throw err;
-            }
-        }
+    logger.info(`🔍 [Market API] 啟動即時查價，初始解析標的: ${symbol}...`);
+
+    // 🌟 將抓取邏輯包裝成獨立函數，方便發生錯誤時無縫重試
+    const executeFetch = async (targetSymbol) => {
+        // A. 抓取即時報價
+        const quote = await yahooFinance.quote(targetSymbol);
+        if (!quote) throw new Error('No data found');
         
-        // 4. 抓取歷史走勢 (近 30 天)
+        // B. 抓取歷史走勢 (近 30 天)
         const period1 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const period2 = new Date().toISOString().split('T')[0]; 
         
-        const historical = await yahooFinance.historical(symbol, { period1, period2 });
-        
-        // 5. 整理近期的收盤價走勢 (提取近 10 個交易日供 AI 速評)
+        const historical = await yahooFinance.historical(targetSymbol, { period1, period2 });
+        if (!historical || historical.length === 0) {
+            throw new Error('No data found');
+        }
+
+        // C. 整理近期的收盤價走勢
         const recentTrend = historical.slice(-10).map(day => ({
-            date: day.date.toISOString().split('T')[0], // 轉為 YYYY-MM-DD
+            date: day.date.toISOString().split('T')[0],
             close: day.close.toFixed(2),
             volume: day.volume
         }));
 
-        // 6. 計算月線簡單均價 (20MA) 作為趨勢支撐/壓力參考
+        // D. 計算月線簡單均價 (20MA)
         const closes = historical.map(d => d.close);
         const monthlyAvg = closes.length > 0 ? (closes.reduce((sum, val) => sum + val, 0) / closes.length).toFixed(2) : 'N/A';
 
-        logger.info(`✅ [Market API] 成功獲取 ${symbol} 走勢資料，現價: ${quote.regularMarketPrice}`);
+        logger.info(`✅ [Market API] 成功獲取 ${targetSymbol} 走勢資料，現價: ${quote.regularMarketPrice}`);
         
         return {
-            symbol: symbol,
-            name: quote.shortName || quote.longName || symbol,
+            symbol: targetSymbol,
+            name: quote.shortName || quote.longName || targetSymbol,
             currentPrice: quote.regularMarketPrice,
             change: quote.regularMarketChange,
             changePercent: (quote.regularMarketChangePercent || 0).toFixed(2) + '%',
@@ -272,7 +259,23 @@ async function fetchStockTrend(rawInput) {
             monthlyAvgPrice: monthlyAvg,
             recentTrend: recentTrend
         };
+    };
+
+    try {
+        // 先嘗試原始標的 (例如 3324.TW 或 NVDA)
+        return await executeFetch(symbol);
     } catch (error) {
+        // 🌟 核心修復：如果原始標的失敗，且是台股 (.TW)，自動重試上櫃 (.TWO)
+        if (isTaiwan && symbol.endsWith('.TW') && error.message.includes('No data found')) {
+            logger.warn(`⚠️ 查無 ${symbol} 歷史資料，確認是否為上櫃股票，自動嘗試 ${baseCode}.TWO ...`);
+            try {
+                return await executeFetch(`${baseCode}.TWO`);
+            } catch (twoError) {
+                logger.error(`❌ [Market API] 獲取 ${baseCode}.TWO 走勢失敗: ${twoError.message}`);
+                return { error: true, message: twoError.message };
+            }
+        }
+        
         logger.error(`❌ [Market API] 獲取 ${symbol} 走勢失敗: ${error.message}`);
         return { error: true, message: error.message };
     }
