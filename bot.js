@@ -45,38 +45,58 @@ client.once('ready', () => {
 // 💬 Discord 指令監聽與工作流
 // ==========================================
 client.on('messageCreate', async (message) => {
-    // 略過機器人自身的訊息
+    // 略過機器人自身的訊息，避免無窮迴圈
     if (message.author.bot) return;
 
     const content = message.content.trim();
 
-    // --------------------------------------------------
-    // 功能一：用戶 QA 累積 (!問)
-    // --------------------------------------------------
-    if (content.startsWith('!問 ')) {
-        const question = content.replace('!問 ', '').trim();
-        ai_analyzer.addPendingQA(message.author.username, question, '');
-        await message.reply('✅ 你的問題已經收錄，AI 將在下一份定時報告的 QA 環節為你客觀解答！');
-    }
+    // 💡 優化：加入 try-catch 區塊，避免任一指令處理中發生例外錯誤導致 Bot 崩潰
+    try {
+        // --------------------------------------------------
+        // 功能一：用戶 QA 累積 (!問)
+        // --------------------------------------------------
+        if (content.startsWith('!問 ')) {
+            const question = content.replace('!問 ', '').trim();
+            
+            // 防呆：確保用戶有輸入內容
+            if (!question) {
+                return message.reply('⚠️ 內容不能為空喔！請輸入你想問的問題，例如：`!問 台積電現在能買嗎？`');
+            }
 
-    // --------------------------------------------------
-    // 功能二：用戶觀點即時識別與回饋 (!觀點)
-    // --------------------------------------------------
-    else if (content.startsWith('!觀點 ')) {
-        const viewpoint = content.replace('!觀點 ', '').trim();
-        await message.reply('⏳ 收到觀點！AI 正在檢視你的邏輯與情緒風險，請稍候...');
-        
-        // 呼叫 AI 進行即時情緒風險評估 (走 Q8 模型)
-        const evaluation = await ai_analyzer.evaluateUserInput(message.author.username, viewpoint, 'viewpoint');
-        await message.reply(`🤖 **AI 觀點速評：**\n${evaluation}\n\n*(此觀點已永久紀錄，將納入後續大盤情緒分析與覆盤)*`);
-    }
+            // 🛠️ 核心修復：加上第 4 個參數 'question'，解決 AI 報告漏答的問題
+            // (後續 ai_analyzer.js 也會配合此參數寫入 JSON 的 type 欄位)
+            ai_analyzer.addPendingQA(message.author.username, question, '', 'question');
+            await message.reply('✅ 你的問題已經收錄，AI 將在下一份定時報告的 QA 環節為你客觀解答！');
+        }
 
-    // --------------------------------------------------
-    // 功能三：強制啟動 ETL 濃縮管線 (!抓新聞) [開發者專用]
-    // --------------------------------------------------
-    else if (content === '!抓新聞') {
-        await message.reply('🕸️ [開發者模式] 正在啟動全網強制抓取與 AI 新聞濃縮 (Q4)，請稍候...');
-        try {
+        // --------------------------------------------------
+        // 功能二：用戶觀點即時識別與回饋 (!觀點)
+        // --------------------------------------------------
+        else if (content.startsWith('!觀點 ')) {
+            const viewpoint = content.replace('!觀點 ', '').trim();
+            
+            // 防呆：確保用戶有輸入內容
+            if (!viewpoint) {
+                return message.reply('⚠️ 內容不能為空喔！請輸入你的觀點，例如：`!觀點 我覺得降息會讓資金流入傳產`');
+            }
+
+            await message.reply('⏳ 收到觀點！AI 正在檢視你的邏輯與情緒風險，請稍候...');
+            
+            // 呼叫 AI 進行即時情緒風險評估 (走 Q8 模型)
+            const evaluation = await ai_analyzer.evaluateUserInput(message.author.username, viewpoint, 'viewpoint');
+            
+            // 🛠️ 核心修復：將觀點評估結果寫入 JSON 時，明確標記 type 為 'viewpoint'
+            ai_analyzer.addPendingQA(message.author.username, viewpoint, evaluation, 'viewpoint');
+            
+            await message.reply(`🤖 **AI 觀點速評：**\n${evaluation}\n\n*(此觀點已永久紀錄，將納入後續大盤情緒分析與覆盤)*`);
+        }
+
+        // --------------------------------------------------
+        // 功能三：強制啟動 ETL 濃縮管線 (!抓新聞) [開發者專用]
+        // --------------------------------------------------
+        else if (content === '!抓新聞') {
+            await message.reply('🕸️ [開發者模式] 正在啟動全網強制抓取與 AI 新聞濃縮 (Q4)，請稍候...');
+            
             if (scheduler && scheduler.triggerAllETL) {
                 // 呼叫第一軌 ETL
                 await scheduler.triggerAllETL();
@@ -84,18 +104,14 @@ client.on('messageCreate', async (message) => {
             } else {
                 await message.reply('⚠️ 排程器尚未就緒，請檢查 Console 狀態。');
             }
-        } catch (error) {
-            logger.error(`❌ 手動抓取新聞失敗: ${error.message}`);
-            await message.reply('❌ 抓取過程發生錯誤，請查看 Console Log。');
         }
-    }
 
-    // --------------------------------------------------
-    // 功能四：強制產出綜合報告 (!test報告) [開發者專用]
-    // --------------------------------------------------
-    else if (content === '!test報告') {
-        await message.reply('⏳ [開發者模式] 正在啟動高階大腦 (Q8) 撰寫市場報告，請稍候...');
-        try {
+        // --------------------------------------------------
+        // 功能四：強制產出綜合報告 (!test報告) [開發者專用]
+        // --------------------------------------------------
+        else if (content === '!test報告') {
+            await message.reply('⏳ [開發者模式] 正在啟動高階大腦 (Q8) 撰寫市場報告，請稍候...');
+            
             // 直接從 DB 撈取「已經處理好的 60 字精華」
             const recentNews = db.getRecentNews(12);
             
@@ -116,11 +132,11 @@ client.on('messageCreate', async (message) => {
             } else {
                 await message.channel.send(finalMessage);
             }
-
-        } catch (error) {
-            logger.error(`❌ 手動產出報告失敗: ${error.message}`);
-            await message.reply('❌ 報告生成失敗，請查看 Console Log 確認 AI 推論狀態。');
         }
+    } catch (error) {
+        // 全域捕捉指令錯誤，避免掛掉
+        logger.error(`❌ 處理 Discord 訊息時發生未預期錯誤: ${error.message}`);
+        await message.reply('❌ 抱歉，系統處理你的指令時發生了錯誤，請查看後台 Log。');
     }
 });
 
