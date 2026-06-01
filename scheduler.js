@@ -1,231 +1,123 @@
-// scheduler.js
-const cron = require('node-cron');
-const logger = require('./logger');
-const db = require('./db');
-const ai_analyzer = require('./services/ai_analyzer');
-const { sendReportToDiscord } = require('./bot'); 
+// services/night_review.js
+const axios = require('axios');
+const db = require('../db');
+const logger = require('../logger');
 
-const cteeScraper = require('./ctee_scraper');
-const udnScraper = require('./udn_scraper');
-const cmoneyScraper = require('./cmoney_scraper');
-
-// ==========================================
-// 🚦 系統狀態鎖 (State Locks) 
-// 用於控制併發，避免資源搶占與重複執行
-// ==========================================
-let isEtlRunning = false;         // 標記是否正在爬蟲或濃縮新聞
-let isReportGenerating = false;   // 標記是否正在生成 AI 報告 (優先權最高)
-let missedEtlDuringReport = false; // 標記是否在報告生成期間錯過了排定的 ETL 任務
-
-// 輔助函數：暫停等待 (Sleep)
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-/**
- * 🌟 核心禮讓機制：等待報告生成完畢
- * 如果發現系統正在生成報告，就卡在這裡等待，直到解鎖為止
- */
-async function waitUntilReportFinished() {
-    if (isReportGenerating) {
-        logger.info('⏸️ [排程系統] 偵測到 8B 核心正在生成報告，ETL 流程暫停 (禮讓算力中)...');
-        while (isReportGenerating) {
-            await sleep(5000); // 每 5 秒檢查一次是否解鎖
-        }
-        logger.info('▶️ [排程系統] 報告生成完畢，ETL 流程恢復執行！');
-    }
+let marketApi;
+try {
+    marketApi = require('./market_api');
+} catch (e) {
+    logger.warn(`⚠️ [Night Review] market_api.js 載入失敗！無法獲取真實報價進行對帳。`);
 }
 
-// ==========================================
-// 🚀 ETL 核心流程 (支援單筆循序處理與暫停)
-// ==========================================
-async function executeNewsETL(scraperModule, sourceName) {
-    logger.info(`🔄 [排程器] 啟動 [${sourceName}] 爬蟲 ETL 流程...`);
-    try {
-        // 抓取前先檢查是否需要禮讓報告
-        await waitUntilReportFinished();
+const OLLAMA_URL = 'http://127.0.0.1:11434/api/generate';
+const MODEL_NAME = 'hf.co/lianghsun/Llama-3.2-Taiwan-3B-Instruct-GGUF:Q8_0';
 
-        // 1. Extract: 呼叫爬蟲抓取新聞
-        const rawArticles = await scraperModule.scrape();
+async function evaluatePrediction(prediction) {
+    logger.info(`🦉 正在對預言 [ID: ${prediction.id} - ${prediction.symbol}] 進行開獎與覆盤...`);
 
-        if (!rawArticles || rawArticles.length === 0) {
-            logger.info(`⚠️ [排程器] [${sourceName}] 沒有抓取到新文章或目前無更新。`);
-            return;
-        }
-
-        const newArticles = rawArticles.filter(article => !db.isArticleExists(article.url));
-
-        if (newArticles.length === 0) {
-            logger.info(`🛑 [排程器] [${sourceName}] 抓取的文章皆已存於資料庫，無須處理。`);
-            return;
-        }
-
-        logger.info(`📥 [排程器] [${sourceName}] 共有 ${newArticles.length} 篇新文章，準備進入 AI 摘要管線...`);
-
-        let processedCount = 0;
-        
-        // 🌟 [優化]: 將併發數改為 1，嚴格執行「一篇一篇處理」，保護 CPU 算力不超載
-        const CONCURRENCY_LIMIT = 1; 
-
-        // 2. Transform & Load: 單篇循序處理
-        for (let i = 0; i < newArticles.length; i += CONCURRENCY_LIMIT) {
-            
-            // 🌟 核心防護：每一篇處理前，檢查是否有人在生成報告，有就暫停
-            await waitUntilReportFinished(); 
-
-            const batch = newArticles.slice(i, i + CONCURRENCY_LIMIT);
-            logger.info(`⚡ [排程器] 正在處理第 ${i + 1} 篇文章 (單篇循序模式)...`);
-
-            await Promise.all(batch.map(async (article) => {
-                try {
-                    const summary = await ai_analyzer.summarizeNews(article.title, article.content);
-                    
-                    const recordToSave = {
-                        url: article.url,
-                        title: article.title,
-                        summary: summary,
-                        content: '' 
-                    };
-
-                    db.saveNewsWithTags(recordToSave, article.symbols || []);
-                    processedCount++;
-                } catch (err) {
-                    logger.error(`❌ [排程器] 單篇文章濃縮失敗 (${article.title}): ${err.message}`);
-                }
-            }));
-            
-            // 處理完一篇後稍微休息 1 秒，讓 CPU 喘口氣
-            await sleep(1000);
-        }
-
-        logger.info(`✅ [排程器] [${sourceName}] ETL 執行完畢！本次新增並濃縮了 ${processedCount} 篇新聞。`);
-    } catch (error) {
-        logger.error(`❌ [排程器] 執行 [${sourceName}] ETL 發生嚴重錯誤: ${error.message}`);
-    }
-}
-
-// ==========================================
-// 🛠️ 全網新聞觸發器 (加入重複執行防護與補發機制)
-// ==========================================
-async function triggerAllETL() {
-    // 🌟 防護 1：如果報告正在生成，直接標記「錯過抓取」並退出，報告完成後會立刻補抓
-    if (isReportGenerating) {
-        logger.warn('⏸️ [排程系統] 發現目前正在生成報告，本次 ETL 抓取任務延後，將於報告完成後立刻補抓。');
-        missedEtlDuringReport = true;
-        return;
-    }
-
-    // 🌟 防護 2：如果有 ETL 正在進行，直接略過，避免重複啟動塞爆記憶體
-    if (isEtlRunning) {
-        logger.warn('⚠️ [排程系統] 發現上一個 ETL 任務尚未結束，本次觸發自動忽略。');
-        return;
-    }
-
-    isEtlRunning = true; // 鎖上 ETL 狀態鎖
-    
-    try {
-        logger.info('==================================================');
-        logger.info('🛠️ [資料管線] 啟動全網新聞強制抓取與 AI 濃縮作業');
-        logger.info('==================================================');
-        
-        await executeNewsETL(udnScraper, '經濟日報');
-        await executeNewsETL(cteeScraper, '工商時報');
-        await executeNewsETL(cmoneyScraper, 'CMoney');
-        
-        logger.info('🏁 [資料管線] 所有平台的 ETL 濃縮作業已完成！');
-    } finally {
-        isEtlRunning = false; // 無論成功失敗，確保解鎖
-    }
-}
-
-// ==========================================
-// ⏰ 系統任務排程管理 (主程式進入點)
-// ==========================================
-logger.info('⏰ [排程器] 核心排程引擎已啟動，開始監控市場與資料流。');
-
-// 任務一：自動清理過期記憶 (每 30 分鐘執行一次)
-cron.schedule('*/30 * * * *', () => {
-    logger.info('🧹 [排程器] 觸發例行維護：開始清理 15 小時前的過期新聞與孤兒標籤...');
-    // 傳入 15 代表只保留 15 小時內的數據
-    if (typeof db.cleanOldNews === 'function') {
-        db.cleanOldNews(15); 
-    }
-}, { timezone: "Asia/Taipei" });
-
-// 任務二：全網情報巡邏與 ETL (每 30 分鐘執行一次)
-cron.schedule('*/30 * * * *', async () => {
-    logger.info('🕸️ [排程器] 定時觸發全網財經新聞巡邏與 ETL...');
-    await triggerAllETL(); 
-}, { timezone: "Asia/Taipei" });
-
-// 任務三：AI 自動化定時報告生成與發布
-const reportSchedules = [
-    { time: '0 6 * * 2-6', name: '06:00 美股收盤與晨間風向' }, 
-    { time: '30 7 * * 1-5', name: '08:00 盤前戰略指南' },
-    { time: '45 9 * * 1-5', name: '10:00 早盤異動雷達' },
-    { time: '45 11 * * 1-5', name: '12:00 午盤情緒觀測' },
-    { time: '45 13 * * 1-5', name: '14:00 台股收盤總結' },
-    { time: '45 17 * * 1-5', name: '18:00 籌碼解析與夜盤前瞻' },
-    { time: '45 20 * * 1-5', name: '21:00 美股開盤風向' },
-    { time: '45 22 * * 1-5', name: '23:00 夜間總結' }
-];
-
-reportSchedules.forEach(schedule => {
-    cron.schedule(schedule.time, async () => {
-        
-        // 🌟 防護：如果上一份報告還卡在產製中，就放棄本次觸發，避免 AI 模型大塞車
-        if (isReportGenerating) {
-            logger.warn(`⚠️ [排程器] 系統目前仍有報告正在生成中，跳過本次報告觸發: 【${schedule.name}】`);
-            return;
-        }
-
-        logger.info(`📢 [排程器] 觸發定時報告發布流程: 【${schedule.name}】`);
-
-        // 🌟 啟動報告生成鎖，這會讓所有正在運行的 ETL 暫停，新的 ETL 乖乖排隊
-        isReportGenerating = true; 
-        
+    let stockData = {};
+    let trendStr = '無法取得即時走勢';
+    if (marketApi) {
         try {
-            // 💡 [優化]: 嚴格限制傳給 AI 萃取的新聞總數，最多只取最新 40 篇
-            // 配合 analyzer 的「少量多次(15篇一組)」，確保效能與覆蓋率平衡
-            const recentNews = db.getRecentNews(40); 
-            logger.info(`📰 [排程器] 從資料庫提取最新 ${recentNews.length} 篇新聞進行多空分析。`);
-
-            // 💡 [優化]: 真正呼叫 market_api 抓取即時市場大盤快照與三大法人，讓 AI 不再閉門造車
-            logger.info('📈 [排程器] 正在即時抓取台美股大盤與三大法人籌碼面數據...');
-            let marketData = {};
-            try {
-                // 確保路徑與你的專案相符，此處假設 market_api 放在 services 資料夾下
-                const marketApi = require('./services/market_api'); 
-                
-                // 盤前與盤後報告才需要加入三大法人數據 (避免盤中 API 取不到而報錯)
-                const includeInstitutional = schedule.name.includes('06:00') || schedule.name.includes('18:00');
-                marketData = await marketApi.getMarketSnapshot(includeInstitutional, true);
-            } catch (apiErr) {
-                logger.error(`⚠️ [排程器] 讀取即時盤勢快照失敗，改用純新聞分析: ${apiErr.message}`);
+            stockData = await marketApi.fetchStockTrend(prediction.symbol);
+            if (!stockData.error) {
+                trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}`).join('\n');
             }
-
-            // 呼叫 8B 模型進行高精度分析
-            const reportContent = await ai_analyzer.generateMarketReport(schedule.name, marketData, recentNews);
-
-            const header = `\n========== 【${schedule.name}】 ==========\n`;
-            const footer = `\n====================================\n`;
-            await sendReportToDiscord(header + reportContent + footer);
-            
-            logger.info(`✅ [排程器] 報告已成功推播至 Discord`);
-
-        } catch (error) {
-            logger.error(`❌ [排程器] 定時報告生成流程中斷: ${error.message}`);
-        } finally {
-            // 🌟 報告生成結束，解除鎖定，讓暫停的 ETL 恢復運作
-            isReportGenerating = false; 
-            logger.info(`🔓 [排程器] 報告鎖定已解除，釋放算力。`);
-
-            // 🌟 如果報告期間錯過了排定的 ETL 任務，立刻啟動補發機制
-            if (missedEtlDuringReport) {
-                logger.info(`▶️ [排程系統] 偵測到報告期間有錯過的 ETL 任務，立即補抓新聞！`);
-                missedEtlDuringReport = false;
-                triggerAllETL(); 
-            }
+        } catch (e) {
+            logger.warn(`⚠️ 無法取得 ${prediction.symbol} 的真實報價，將僅依賴文字進行覆盤。`);
         }
-    }, { timezone: "Asia/Taipei" });
-});
+    }
 
-module.exports = { executeNewsETL, triggerAllETL };
+    const symbolNews = db.searchNewsByKeyword('', prediction.symbol, 3);
+    let realityContext = '目前資料庫暫無該標的之近期重大新聞。';
+    if (symbolNews && symbolNews.length > 0) {
+        // 🌟 核心修改：改用 n.content 而不是 n.summary
+        realityContext = symbolNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n內文: ${n.content}`).join('\n\n');
+    }
+
+    const prompt = `你是一位嚴格且毒舌的華爾街量化交易檢討員。請對以下「一週前的詳查報告」進行殘酷的「反身性」覆盤：
+
+【一週前的預測紀錄】
+- 標的：${prediction.symbol}
+- 當時的預測內容：
+${prediction.prediction_text}
+
+【今日市場現實 (開獎結果參考)】
+- 目前現價：${stockData.currentPrice || '未知'} (${stockData.changePercent || '未知'})
+- 近期收盤走勢：
+${trendStr}
+- 近期關聯新聞：
+${realityContext}
+
+【強制任務要求】：
+1. 殘酷對帳：一週前的報告看多還是看空？跟現在的「真實走勢與現價」吻合嗎？
+2. 盲點抓漏：如果預測錯誤，無情指出當時的「情緒盲點」、「過度樂觀/悲觀」或「被新聞帶風向」的狀況。如果預測正確，總結成功的核心邏輯。
+3. 經驗法則：請淬鍊出一段 100 字以內的「經驗法則(Lesson)」，這段話未來會在遇到類似狀況時用來警告你自己。
+4. 語系強制使用「繁體中文 (zh-TW)」。
+5. 直接以 Markdown 格式輸出覆盤結果，不需多餘的問候語。`;
+
+    try {
+        const response = await axios.post(OLLAMA_URL, {
+            model: MODEL_NAME,
+            prompt: prompt,
+            stream: false,
+            options: { temperature: 0.6, num_ctx: 8192 } // 🌟 放大 3B 覆盤模型的記憶體，容納完整新聞內文
+        }, { timeout: 1800000 }); 
+
+        const lessonText = response.data.response.trim();
+        logger.info(`💡 覆盤結論產出完成。`);
+
+        await db.saveVectorMemory(`關於 ${prediction.symbol} 的市場教訓：${lessonText}`, { 
+            type: '覆盤教訓', 
+            symbol: prediction.symbol 
+        });
+
+        db.markPredictionEvaluated(prediction.id);
+        logger.info(`✅ 預言 [ID: ${prediction.id}] 已結案並刻入記憶體。`);
+
+        return lessonText;
+
+    } catch (error) {
+        logger.error(`❌ 覆盤發生錯誤: ${error.message}`);
+        return `⚠️ 針對 ${prediction.symbol} 的覆盤因系統超時或錯誤而失敗。`;
+    }
+}
+
+async function runWeeklyReview() {
+    logger.info('==================================================');
+    logger.info('🦉 啟動深夜反身性覆盤作業 (Night Review)');
+    logger.info('==================================================');
+
+    const duePredictions = db.getDuePredictions();
+
+    if (!duePredictions || duePredictions.length === 0) {
+        logger.info('🛌 今晚沒有需要開獎的預言，AI 繼續休息。');
+        return null; 
+    }
+
+    logger.info(`🔍 發現 ${duePredictions.length} 筆到期的預言，準備開獎...`);
+
+    let finalDiscordReport = `今晚共有 **${duePredictions.length}** 筆一週前的詳查報告到期，以下是 AI 的殘酷對帳與覆盤總結：\n\n`;
+
+    for (const prediction of duePredictions) {
+        const reviewContent = await evaluatePrediction(prediction);
+        
+        finalDiscordReport += `### 🎯 標的：${prediction.symbol}\n`;
+        finalDiscordReport += `${reviewContent}\n\n`;
+        finalDiscordReport += `------------------------------------\n\n`;
+
+        await new Promise(res => setTimeout(res, 5000));
+    }
+
+    logger.info('🏁 深夜覆盤作業全部完成！');
+    return finalDiscordReport;
+}
+
+module.exports = { runWeeklyReview };
+
+if (require.main === module) {
+    runWeeklyReview().then(report => {
+        if (report) console.log(report);
+    });
+}
