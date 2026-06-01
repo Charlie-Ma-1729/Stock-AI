@@ -467,7 +467,6 @@ async function generateMarketReport(reportType, globalMarketData = {}, compresse
 
 /**
  * 4. 用戶模糊個股語意分析與即時診斷
- * 🌟 [重磅修復] 導入 JSON 強制模式、字典查代號、與嚴格繁體中文約束
  */
 async function evaluateUserInput(userName, userInput, type) {
     let instantEval = '';
@@ -492,14 +491,13 @@ async function evaluateUserInput(userName, userInput, type) {
                 model: MODEL_8B, 
                 prompt, 
                 stream: false, 
-                format: 'json', // 🌟 解除封印：啟用 JSON 強制模式
+                format: 'json', 
                 options: { temperature: 0.1, num_ctx: 2048 }
             }, { timeout: MAX_TIMEOUT_MS });
             
             const rawResponse = response.data.response;
             logger.info(`  └─ 🤖 [原始回覆預覽]: ${rawResponse.substring(0, 50)}...`);
 
-            // 🌟 導入強健的 JSON 解析器
             let parsed;
             try {
                 parsed = safeParseJSON(rawResponse);
@@ -508,18 +506,16 @@ async function evaluateUserInput(userName, userInput, type) {
                 throw new Error("無法解析出正確的 JSON 結構");
             }
             
-            // 🌟 核心修復：攔截 AI 抓出的公司名稱，交由我們的字典去查正確代號
             const compName = parsed.company_name || '未定';
             let finalTargetDisplay = compName;
             
             if (compName !== '未定') {
                 const mappedSymbol = mapNameToSymbol(compName);
                 if (mappedSymbol) {
-                    finalTargetDisplay = `${compName} (${mappedSymbol})`; // 字典查到了，掛上正確代號 (ex: 雙鴻 (3324.TW))
+                    finalTargetDisplay = `${compName} (${mappedSymbol})`; 
                 }
             }
 
-            // 組合出精美且正確的 Discord 回應
             instantEval = `🎯 **標的識別**：${finalTargetDisplay}\n💡 **觀點速評**：${parsed.evaluation || '無'}`;
             
             logger.info(`[AI 情緒與個股識別 - 8B] ✅ 解讀完成 (耗時: ${((Date.now() - startTime) / 1000).toFixed(2)}s)`);
@@ -529,37 +525,30 @@ async function evaluateUserInput(userName, userInput, type) {
         }
     }
     
-    // 將結果記錄到 QA 檔案中，供後續大報告使用
     addPendingQA(userName, userInput, instantEval, type);
     return instantEval;
 }
 
 /**
  * 🌟 5. 新增：個股即時走勢速評 (走輕量模型，求快)
- * 供 Discord !查 指令專用，結合 Market API 與資料庫中的關聯新聞進行極速診斷
+ * 供 Discord !查 指令專用
  */
 async function quickAnalyzeStock(symbol, stockData) {
     logger.info(`[AI 即時速評 - 3B] ⚡ 啟動 ${symbol} 走勢與新聞關聯分析...`);
     const startTime = Date.now();
 
-    // 將近 10 日的走勢陣列轉為文字
     const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
     
-    // 🌟 核心擴充：從資料庫撈取 48 小時內的近期新聞，過濾出與該標的有關的內容
     const allRecentNews = db.getRecentNews(48);
-    const cleanSymbol = symbol.replace(/\.TW|\.TWO/gi, ''); // 拔掉後綴，保留純代號
+    const cleanSymbol = symbol.replace(/\.TW|\.TWO/gi, ''); 
     const stockName = stockData.name || symbol;
 
     const relatedNews = allRecentNews.filter(news => {
-        // 比對條件 1: 新聞標籤剛好有這檔股票
         const matchSymbol = news.symbols && (news.symbols.includes(symbol) || news.symbols.includes(cleanSymbol));
-        // 比對條件 2: 新聞標題或摘要提到了這家公司的名字
         const matchName = stockName && (news.title.includes(stockName) || (news.summary && news.summary.includes(stockName)));
-        // 比對條件 3: 新聞標題或摘要提到了純數字代號
         const matchCleanName = news.title.includes(cleanSymbol);
-        
         return matchSymbol || matchName || matchCleanName;
-    }).slice(0, 5); // 最多只取 5 篇，避免 Prompt 太長被截斷
+    }).slice(0, 5); 
 
     let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
     if (relatedNews.length > 0) {
@@ -593,13 +582,12 @@ ${newsContext}
             model: MODEL_3B, 
             prompt: prompt, 
             stream: false, 
-            options: { temperature: 0.2, num_ctx: 2048 } // 稍微放大 Context 給新聞閱讀
+            options: { temperature: 0.2, num_ctx: 2048 } 
         }, { timeout: MAX_TIMEOUT_MS });
 
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
         logger.info(`[AI 即時速評 - 3B] ✅ 速評完成 (耗時: ${duration}s)`);
         
-        // 組合最終回傳文字，附上整理好的基礎報價數據與新聞參考篇數
         const baseInfo = `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n**📊 本益比 (PE)**：${stockData.peRatio}\n**📰 關聯新聞**：參考了 ${relatedNews.length} 篇\n\n`;
         return baseInfo + `**💡 AI 走勢與題材解讀：**\n${response.data.response.trim()}`;
 
@@ -609,4 +597,77 @@ ${newsContext}
     }
 }
 
-module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock };
+/**
+ * 🌟 6. 新增：個股深度詳查報告 (走 8B 重裝模型，求精準與深度)
+ * 供 Discord !詳查 指令專用
+ */
+async function detailedAnalyzeStock(symbol, stockData) {
+    logger.info(`[AI 深度詳查 - 8B] 🧠 啟動 ${symbol} 深度解析...`);
+    const startTime = Date.now();
+
+    // 將近 10 日的走勢陣列轉為文字
+    const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
+    
+    // 擴大撈取範圍 (72小時)
+    const allRecentNews = db.getRecentNews(72);
+    const cleanSymbol = symbol.replace(/\.TW|\.TWO/gi, ''); 
+    const stockName = stockData.name || symbol;
+
+    const relatedNews = allRecentNews.filter(news => {
+        const matchSymbol = news.symbols && (news.symbols.includes(symbol) || news.symbols.includes(cleanSymbol));
+        const matchName = stockName && (news.title.includes(stockName) || (news.summary && news.summary.includes(stockName)));
+        const matchCleanName = news.title.includes(cleanSymbol);
+        return matchSymbol || matchName || matchCleanName;
+    }).slice(0, 10); // 取最多 10 篇新聞供大腦閱讀
+
+    let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
+    if (relatedNews.length > 0) {
+        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n摘要重點: ${n.summary}`).join('\n\n');
+        logger.info(`[AI 深度詳查 - 8B] 📰 成功從資料庫撈取 ${relatedNews.length} 篇關聯新聞餵給 AI。`);
+    } else {
+        logger.warn(`[AI 深度詳查 - 8B] ⚠️ 資料庫內目前找不到 ${stockName} (${symbol}) 的相關新聞。`);
+    }
+
+    const prompt = `你是一位深諳反身性與行為金融學的台美股資深操盤手。請根據以下量價數據與近期新聞，為這檔股票寫一份「深度詳查報告」(約 300-500 字)。
+【標的】：${stockName} (${symbol})
+【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
+【月線(20MA)均價】：${stockData.monthlyAvgPrice}
+【本益比】：${stockData.peRatio}
+【52週高低點】：高 ${stockData.fiftyTwoWeekHigh} / 低 ${stockData.fiftyTwoWeekLow}
+
+【近 10 日歷史走勢】：
+${trendStr}
+
+【近期相關新聞 (72小時內)】：
+${newsContext}
+
+【強制任務要求】：
+1. 籌碼與技術面判讀：判斷目前多空趨勢、現價與月線的乖離、支撐與壓力區在哪。
+2. 消息面與基本面共振：詳細解讀「近期相關新聞」中的利多或利空，並判斷市場是否已經反映（利多出盡或利空出盡）。如果無新聞，則跳過此項。
+3. 操作建議與風險預警：給出具體的短線或波段操作思維，並明確點出破局停損點或追高風險。
+4. 語系強制使用「繁體中文 (zh-TW)」。
+5. 專業且嚴謹，不要使用過度浮誇的詞彙，請直接以 Markdown 格式排版輸出整齊的報告。`;
+
+    try {
+        const response = await axios.post(OLLAMA_URL, {
+            model: MODEL_8B, // 🌟 使用 8B 重裝模型
+            prompt: prompt, 
+            stream: false, 
+            options: { temperature: 0.3, num_ctx: 4096 } // 放大 Context 給更多新聞
+        }, { timeout: MAX_TIMEOUT_MS });
+
+        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+        logger.info(`[AI 深度詳查 - 8B] ✅ 詳查完成 (耗時: ${duration}s)`);
+        
+        // 組合最終回傳文字
+        const baseInfo = `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n**📊 本益比 (PE)**：${stockData.peRatio}\n**📰 關聯新聞**：深度參考了 ${relatedNews.length} 篇\n\n`;
+        return baseInfo + `**🧠 AI 深度詳查報告：**\n${response.data.response.trim()}`;
+
+    } catch (error) {
+        logger.error(`[AI 深度詳查 - 8B] ❌ 詳查失敗: ${error.message}`);
+        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n\n⚠️ 系統提示：AI 深度解讀模組暫時離線或回應超時。`;
+    }
+}
+
+// 🌟 核心修復：記得把 detailedAnalyzeStock 導出給 bot.js 使用！
+module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock, detailedAnalyzeStock };
