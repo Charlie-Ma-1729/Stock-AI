@@ -1,123 +1,122 @@
-// services/night_review.js
-const axios = require('axios');
-const db = require('../db');
-const logger = require('../logger');
+// scheduler.js
+const cron = require('node-cron');
+const logger = require('./logger');
+const db = require('./db');
+const { sendReportToDiscord } = require('./bot'); 
 
-let marketApi;
-try {
-    marketApi = require('./market_api');
-} catch (e) {
-    logger.warn(`⚠️ [Night Review] market_api.js 載入失敗！無法獲取真實報價進行對帳。`);
-}
+const cteeScraper = require('./ctee_scraper');
+const udnScraper = require('./udn_scraper');
+const cmoneyScraper = require('./cmoney_scraper');
 
-const OLLAMA_URL = 'http://127.0.0.1:11434/api/generate';
-const MODEL_NAME = 'hf.co/lianghsun/Llama-3.2-Taiwan-3B-Instruct-GGUF:Q8_0';
+// ==========================================
+// 🚦 系統狀態鎖 (State Locks) 
+// ==========================================
+let isEtlRunning = false; 
 
-async function evaluatePrediction(prediction) {
-    logger.info(`🦉 正在對預言 [ID: ${prediction.id} - ${prediction.symbol}] 進行開獎與覆盤...`);
-
-    let stockData = {};
-    let trendStr = '無法取得即時走勢';
-    if (marketApi) {
-        try {
-            stockData = await marketApi.fetchStockTrend(prediction.symbol);
-            if (!stockData.error) {
-                trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}`).join('\n');
-            }
-        } catch (e) {
-            logger.warn(`⚠️ 無法取得 ${prediction.symbol} 的真實報價，將僅依賴文字進行覆盤。`);
-        }
-    }
-
-    const symbolNews = db.searchNewsByKeyword('', prediction.symbol, 3);
-    let realityContext = '目前資料庫暫無該標的之近期重大新聞。';
-    if (symbolNews && symbolNews.length > 0) {
-        // 🌟 核心修改：改用 n.content 而不是 n.summary
-        realityContext = symbolNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n內文: ${n.content}`).join('\n\n');
-    }
-
-    const prompt = `你是一位嚴格且毒舌的華爾街量化交易檢討員。請對以下「一週前的詳查報告」進行殘酷的「反身性」覆盤：
-
-【一週前的預測紀錄】
-- 標的：${prediction.symbol}
-- 當時的預測內容：
-${prediction.prediction_text}
-
-【今日市場現實 (開獎結果參考)】
-- 目前現價：${stockData.currentPrice || '未知'} (${stockData.changePercent || '未知'})
-- 近期收盤走勢：
-${trendStr}
-- 近期關聯新聞：
-${realityContext}
-
-【強制任務要求】：
-1. 殘酷對帳：一週前的報告看多還是看空？跟現在的「真實走勢與現價」吻合嗎？
-2. 盲點抓漏：如果預測錯誤，無情指出當時的「情緒盲點」、「過度樂觀/悲觀」或「被新聞帶風向」的狀況。如果預測正確，總結成功的核心邏輯。
-3. 經驗法則：請淬鍊出一段 100 字以內的「經驗法則(Lesson)」，這段話未來會在遇到類似狀況時用來警告你自己。
-4. 語系強制使用「繁體中文 (zh-TW)」。
-5. 直接以 Markdown 格式輸出覆盤結果，不需多餘的問候語。`;
-
+// ==========================================
+// 🚀 超輕量 ETL 核心流程 (Zero AI Compute, Full Text)
+// ==========================================
+async function executeNewsETL(scraperModule, sourceName) {
+    logger.info(`🔄 [排程器] 啟動 [${sourceName}] 爬蟲 ETL 流程 (純文字完整保留模式)...`);
     try {
-        const response = await axios.post(OLLAMA_URL, {
-            model: MODEL_NAME,
-            prompt: prompt,
-            stream: false,
-            options: { temperature: 0.6, num_ctx: 8192 } // 🌟 放大 3B 覆盤模型的記憶體，容納完整新聞內文
-        }, { timeout: 1800000 }); 
+        const rawArticles = await scraperModule.scrape();
 
-        const lessonText = response.data.response.trim();
-        logger.info(`💡 覆盤結論產出完成。`);
+        if (!rawArticles || rawArticles.length === 0) {
+            return;
+        }
 
-        await db.saveVectorMemory(`關於 ${prediction.symbol} 的市場教訓：${lessonText}`, { 
-            type: '覆盤教訓', 
-            symbol: prediction.symbol 
-        });
+        const newArticles = rawArticles.filter(article => !db.isArticleExists(article.url));
 
-        db.markPredictionEvaluated(prediction.id);
-        logger.info(`✅ 預言 [ID: ${prediction.id}] 已結案並刻入記憶體。`);
+        if (newArticles.length === 0) {
+            return;
+        }
 
-        return lessonText;
+        logger.info(`📥 [排程器] [${sourceName}] 共有 ${newArticles.length} 篇新文章，直接完整寫入資料庫...`);
 
+        let processedCount = 0;
+
+        for (const article of newArticles) {
+            try {
+                // 🌟 核心修改：不再裁切！直接將整篇文章的完整內文存入 content 欄位
+                const safeContent = article.content || '';
+                
+                const recordToSave = {
+                    url: article.url,
+                    title: article.title,
+                    summary: '', // 背景不再浪費算力做摘要
+                    content: safeContent // 完整內文保留，供後續 !詳查 使用
+                };
+
+                db.saveNewsWithTags(recordToSave, article.symbols || []);
+                processedCount++;
+            } catch (err) {
+                logger.error(`❌ [排程器] 單篇文章儲存失敗 (${article.title}): ${err.message}`);
+            }
+        }
+
+        logger.info(`✅ [排程器] [${sourceName}] 輕量 ETL 執行完畢！本次新增 ${processedCount} 篇新聞。`);
     } catch (error) {
-        logger.error(`❌ 覆盤發生錯誤: ${error.message}`);
-        return `⚠️ 針對 ${prediction.symbol} 的覆盤因系統超時或錯誤而失敗。`;
+        logger.error(`❌ [排程器] 執行 [${sourceName}] ETL 發生嚴重錯誤: ${error.message}`);
     }
 }
 
-async function runWeeklyReview() {
-    logger.info('==================================================');
-    logger.info('🦉 啟動深夜反身性覆盤作業 (Night Review)');
-    logger.info('==================================================');
-
-    const duePredictions = db.getDuePredictions();
-
-    if (!duePredictions || duePredictions.length === 0) {
-        logger.info('🛌 今晚沒有需要開獎的預言，AI 繼續休息。');
-        return null; 
+// ==========================================
+// 🛠️ 全網新聞觸發器
+// ==========================================
+async function triggerAllETL() {
+    if (isEtlRunning) {
+        logger.warn('⚠️ [排程系統] 上一個爬蟲任務尚未結束，本次觸發略過。');
+        return;
     }
 
-    logger.info(`🔍 發現 ${duePredictions.length} 筆到期的預言，準備開獎...`);
-
-    let finalDiscordReport = `今晚共有 **${duePredictions.length}** 筆一週前的詳查報告到期，以下是 AI 的殘酷對帳與覆盤總結：\n\n`;
-
-    for (const prediction of duePredictions) {
-        const reviewContent = await evaluatePrediction(prediction);
+    isEtlRunning = true; 
+    
+    try {
+        logger.info('==================================================');
+        logger.info('🛠️ [資料管線] 啟動全網新聞輕量抓取作業 (完整內文保留)');
+        logger.info('==================================================');
         
-        finalDiscordReport += `### 🎯 標的：${prediction.symbol}\n`;
-        finalDiscordReport += `${reviewContent}\n\n`;
-        finalDiscordReport += `------------------------------------\n\n`;
-
-        await new Promise(res => setTimeout(res, 5000));
+        await executeNewsETL(udnScraper, '經濟日報');
+        await executeNewsETL(cteeScraper, '工商時報');
+        await executeNewsETL(cmoneyScraper, 'CMoney');
+        
+        logger.info('🏁 [資料管線] 所有平台的輕量 ETL 作業已完成！');
+    } finally {
+        isEtlRunning = false; 
     }
-
-    logger.info('🏁 深夜覆盤作業全部完成！');
-    return finalDiscordReport;
 }
 
-module.exports = { runWeeklyReview };
+// ==========================================
+// ⏰ 系統任務排程管理
+// ==========================================
+logger.info('⏰ [排程器] 輕量化核心排程引擎已啟動。');
 
-if (require.main === module) {
-    runWeeklyReview().then(report => {
-        if (report) console.log(report);
-    });
-}
+cron.schedule('*/30 * * * *', () => {
+    logger.info('🧹 [排程器] 觸發例行維護：清理過期新聞...');
+    if (typeof db.cleanOldNews === 'function') {
+        db.cleanOldNews(72); 
+    }
+}, { timezone: "Asia/Taipei" });
+
+cron.schedule('0 * * * *', async () => {
+    logger.info('🕸️ [排程器] 定時觸發全網財經新聞輕量抓取...');
+    await triggerAllETL(); 
+}, { timezone: "Asia/Taipei" });
+
+cron.schedule('0 2 * * *', async () => {
+    logger.info('🌙 [排程器] 啟動夜間覆盤程序：檢驗一週前的詳查報告...');
+    try {
+        const nightReview = require('./services/night_review');
+        const reviewContent = await nightReview.runWeeklyReview();
+        
+        if (reviewContent) {
+            await sendReportToDiscord(`\n========== 【🌙 AI 一週回測殘酷覆盤】 ==========\n${reviewContent}\n====================================\n`);
+        } else {
+            logger.info('🌙 [排程器] 今日無一週前之報告需覆盤，跳過推播。');
+        }
+    } catch (error) {
+        logger.error(`❌ [排程器] 夜間覆盤程序中斷: ${error.message}`);
+    }
+}, { timezone: "Asia/Taipei" });
+
+module.exports = { executeNewsETL, triggerAllETL };
