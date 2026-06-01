@@ -535,18 +535,42 @@ async function evaluateUserInput(userName, userInput, type) {
 }
 
 /**
- * 🌟 5. 個股即時走勢速評 (走輕量模型，求快)
- * 供 Discord !查 指令專用，結合 Market API 回傳之量化數據給出解讀
+ * 🌟 5. 新增：個股即時走勢速評 (走輕量模型，求快)
+ * 供 Discord !查 指令專用，結合 Market API 與資料庫中的關聯新聞進行極速診斷
  */
 async function quickAnalyzeStock(symbol, stockData) {
-    logger.info(`[AI 即時速評 - 3B] ⚡ 啟動 ${symbol} 走勢分析...`);
+    logger.info(`[AI 即時速評 - 3B] ⚡ 啟動 ${symbol} 走勢與新聞關聯分析...`);
     const startTime = Date.now();
 
     // 將近 10 日的走勢陣列轉為文字
     const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
     
-    const prompt = `你是一位專業台美股分析師。請根據以下即時與歷史數據，給出一段簡潔有力的「個股速評」(大約 100-150 字)。
-【標的】：${stockData.name || symbol} (${symbol})
+    // 🌟 核心擴充：從資料庫撈取 48 小時內的近期新聞，過濾出與該標的有關的內容
+    const allRecentNews = db.getRecentNews(48);
+    const cleanSymbol = symbol.replace(/\.TW|\.TWO/gi, ''); // 拔掉後綴，保留純代號
+    const stockName = stockData.name || symbol;
+
+    const relatedNews = allRecentNews.filter(news => {
+        // 比對條件 1: 新聞標籤剛好有這檔股票
+        const matchSymbol = news.symbols && (news.symbols.includes(symbol) || news.symbols.includes(cleanSymbol));
+        // 比對條件 2: 新聞標題或摘要提到了這家公司的名字
+        const matchName = stockName && (news.title.includes(stockName) || (news.summary && news.summary.includes(stockName)));
+        // 比對條件 3: 新聞標題或摘要提到了純數字代號
+        const matchCleanName = news.title.includes(cleanSymbol);
+        
+        return matchSymbol || matchName || matchCleanName;
+    }).slice(0, 5); // 最多只取 5 篇，避免 Prompt 太長被截斷
+
+    let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
+    if (relatedNews.length > 0) {
+        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n摘要重點: ${n.summary}`).join('\n\n');
+        logger.info(`[AI 即時速評 - 3B] 📰 成功從資料庫撈取 ${relatedNews.length} 篇關聯新聞餵給 AI。`);
+    } else {
+        logger.warn(`[AI 即時速評 - 3B] ⚠️ 資料庫內目前找不到 ${stockName} (${symbol}) 的相關新聞。`);
+    }
+
+    const prompt = `你是一位專業台美股分析師。請根據以下即時數據、歷史走勢與近期新聞，給出一段簡潔有力的「個股速評」(大約 150-200 字)。
+【標的】：${stockName} (${symbol})
 【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
 【月線(20MA)均價】：${stockData.monthlyAvgPrice}
 【本益比】：${stockData.peRatio}
@@ -554,26 +578,30 @@ async function quickAnalyzeStock(symbol, stockData) {
 【近 10 日歷史走勢】：
 ${trendStr}
 
+【近期相關新聞】：
+${newsContext}
+
 【強制任務要求】：
 1. 判斷目前趨勢是多頭、空頭還是盤整。
 2. 點出現價與月線(20MA)的乖離關係 (例如：已跌破月線轉弱、或站穩月線具備支撐)。
-3. 語系強制使用「繁體中文 (zh-TW)」。
-4. 語氣客觀專業，直接給結論，不要廢話，不要 Markdown 大標題，直接輸出一段文字即可。`;
+3. 如果有提供「近期相關新聞」，請務必將新聞的「利多/利空題材」與股價走勢結合解讀。如果無新聞則專注於技術面。
+4. 語系強制使用「繁體中文 (zh-TW)」。
+5. 語氣客觀專業，直接給結論，不要廢話，不要 Markdown 大標題。`;
 
     try {
         const response = await axios.post(OLLAMA_URL, {
-            model: MODEL_3B, // 使用 3B 輕量引擎，確保能在幾秒內回應
+            model: MODEL_3B, 
             prompt: prompt, 
             stream: false, 
-            options: { temperature: 0.2, num_ctx: 1024 }
-        }, { timeout: MAX_TIMEOUT_MS }); // 🌟 改用 MAX_TIMEOUT_MS 防範本機模型載入過慢
+            options: { temperature: 0.2, num_ctx: 2048 } // 稍微放大 Context 給新聞閱讀
+        }, { timeout: MAX_TIMEOUT_MS });
 
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
         logger.info(`[AI 即時速評 - 3B] ✅ 速評完成 (耗時: ${duration}s)`);
         
-        // 組合最終回傳文字，附上整理好的基礎報價數據
-        const baseInfo = `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n**📊 本益比 (PE)**：${stockData.peRatio}\n\n`;
-        return baseInfo + `**💡 AI 走勢解讀：**\n${response.data.response.trim()}`;
+        // 組合最終回傳文字，附上整理好的基礎報價數據與新聞參考篇數
+        const baseInfo = `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n**📊 本益比 (PE)**：${stockData.peRatio}\n**📰 關聯新聞**：參考了 ${relatedNews.length} 篇\n\n`;
+        return baseInfo + `**💡 AI 走勢與題材解讀：**\n${response.data.response.trim()}`;
 
     } catch (error) {
         logger.error(`[AI 即時速評 - 3B] ❌ 速評失敗: ${error.message}`);
@@ -581,64 +609,4 @@ ${trendStr}
     }
 }
 
-/**
- * 🌟 6. 新增：深度個股問答與綜合分析 (走高階模型 8B)
- * 供 Discord !詳查 指令專用，融合「量化走勢」、「質化新聞」與「使用者具體問題」進行推演
- */
-async function detailedAnalyzeStock(symbol, stockData, relatedNews, userQuestion) {
-    logger.info(`[AI 深度檢索 - 8B] 🔍 啟動 ${symbol} 深度報告推演...`);
-    const startTime = Date.now();
-
-    // 格式化：近 10 日的走勢
-    const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
-    
-    // 格式化：關聯新聞摘要
-    let newsStr = '無近期相關新聞。';
-    if (relatedNews && relatedNews.length > 0) {
-        newsStr = relatedNews.map((n, i) => `[${i + 1}] ${n.title}\n摘要重點: ${n.summary || n.compressed_summary}`).join('\n\n');
-    }
-
-    const prompt = `你是一位深諳籌碼面與消息面的專業台美股分析師。
-現在有一位投資人針對【${stockData.name || symbol} (${symbol})】提出了具體的疑問：「${userQuestion}」
-
-請綜合以下客觀數據與近期新聞，為他進行客觀、深度的解答。
-
-【量化數據 (基礎面與近期走勢)】：
-- 即時報價：${stockData.currentPrice} (${stockData.changePercent})
-- 月線(20MA)均價：${stockData.monthlyAvgPrice}
-- 本益比(PE)：${stockData.peRatio}
-- 近 10 日走勢：
-${trendStr}
-
-【質化數據 (近期相關新聞，有助於研判消息面與未來題材)】：
-${newsStr}
-
-【強制任務與輸出規範】：
-1. 語系強制：必須且只能使用「繁體中文 (zh-TW)」。
-2. 直接破題：第一段請直接針對他的問題「${userQuestion}」給出明確的見解與答案。
-3. 數據佐證：在論述中，必須引用上方的報價走勢或新聞內容來支持你的論點 (例如：跌破月線代表轉弱、或某篇新聞的題材具備利多)。
-4. 機率與風險思維：分析師絕不給出 100% 穩賺或必跌的建議，必須給出「如果跌破/突破XX價格，代表趨勢反轉」的防守點或風險提示。
-5. 專業排版：可以使用 Markdown 條列式或粗體讓版面易讀，但不要輸出任何前言或結語，直接給出分析正文。`;
-
-    try {
-        const response = await axios.post(OLLAMA_URL, {
-            model: MODEL_8B, // 使用 8B 核心引擎進行複雜推理
-            prompt: prompt, 
-            stream: false, 
-            options: { temperature: 0.3, num_ctx: 4096 } // 給予較大的 context window 以容納多篇新聞
-        }, { timeout: MAX_TIMEOUT_MS }); 
-
-        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-        logger.info(`[AI 深度檢索 - 8B] ✅ 報告推演完成 (耗時: ${duration}s)`);
-        
-        // 組合最終回傳文字，附上整理好的基礎報價與新聞篇數
-        const baseInfo = `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent}) ｜ **📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n**📰 關聯新聞情報**：參考了近 ${relatedNews.length} 篇相關文章\n\n`;
-        return baseInfo + response.data.response.trim();
-
-    } catch (error) {
-        logger.error(`[AI 深度檢索 - 8B] ❌ 報告推演失敗: ${error.message}`);
-        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n\n⚠️ 系統提示：AI 深度推演模組暫時離線或處理超時，無法完成您的問題：「${userQuestion}」。`;
-    }
-}
-
-module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock, detailedAnalyzeStock };
+module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock };
