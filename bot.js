@@ -133,6 +133,43 @@ client.on('messageCreate', async (message) => {
                 await message.channel.send(finalMessage);
             }
         }
+
+        // --------------------------------------------------
+        // 功能五：🌟 個股即時查價與 AI 走勢速評 (!查)
+        // --------------------------------------------------
+        else if (content.startsWith('!查')) {
+            // 支援 "!查2330" 或 "!查 NVDA" 格式，去除指令並轉大寫
+            const symbol = content.replace('!查', '').trim().toUpperCase();
+            
+            if (!symbol) {
+                return message.reply('⚠️ 請輸入要查詢的股票代號，例如：`!查 2330`、`!查0050` 或 `!查 NVDA`');
+            }
+
+            // 發送初步回應，讓使用者知道系統已經收到並正在優先處理
+            const waitMsg = await message.reply(`⏳ 正在攔截系統資源... 優先為您獲取 **${symbol}** 的即時報價與近期走勢，並交由 AI 輕量模型速評中，請稍候...`);
+            
+            try {
+                // 載入 market_api 模組
+                const marketApi = require('./services/market_api');
+                
+                // 呼叫市場 API 抓取個股走勢與報價資料 (預留介面：fetchStockTrend)
+                const stockData = await marketApi.fetchStockTrend(symbol);
+                
+                if (!stockData || stockData.error) {
+                    return waitMsg.edit(`❌ 查詢失敗：無法獲取 **${symbol}** 的報價與走勢資料。\n(台股請確認代號，美股請確認 Ticker 是否正確)`);
+                }
+
+                // 呼叫 AI 進行輕量快速分析 (預留介面：quickAnalyzeStock)
+                const analysisResult = await ai_analyzer.quickAnalyzeStock(symbol, stockData);
+
+                // 將最終結果回傳至 Discord
+                await waitMsg.edit(`📊 **【${symbol}】即時報價與 AI 走勢速評**\n\n${analysisResult}`);
+
+            } catch (err) {
+                logger.error(`❌ [Discord Bot] 查價指令 (!查 ${symbol}) 失敗: ${err.message}`);
+                await waitMsg.edit(`❌ 系統查詢或分析過程中發生未預期錯誤，請檢查系統後台紀錄。`);
+            }
+        }
     } catch (error) {
         // 全域捕捉指令錯誤，避免掛掉
         logger.error(`❌ 處理 Discord 訊息時發生未預期錯誤: ${error.message}`);

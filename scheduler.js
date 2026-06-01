@@ -15,6 +15,7 @@ const cmoneyScraper = require('./cmoney_scraper');
 // ==========================================
 let isEtlRunning = false;         // 標記是否正在爬蟲或濃縮新聞
 let isReportGenerating = false;   // 標記是否正在生成 AI 報告 (優先權最高)
+let missedEtlDuringReport = false; // 標記是否在報告生成期間錯過了排定的 ETL 任務
 
 // 輔助函數：暫停等待 (Sleep)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -61,13 +62,13 @@ async function executeNewsETL(scraperModule, sourceName) {
 
         let processedCount = 0;
         
-        // 🌟 [優化]: 將併發數改為 1，嚴格執行「一篇一篇處理」，保護 CPU 算力不超載[cite: 3]
+        // 🌟 [優化]: 將併發數改為 1，嚴格執行「一篇一篇處理」，保護 CPU 算力不超載
         const CONCURRENCY_LIMIT = 1; 
 
         // 2. Transform & Load: 單篇循序處理
         for (let i = 0; i < newArticles.length; i += CONCURRENCY_LIMIT) {
             
-            // 🌟 核心防護：每一篇處理前，檢查是否有人在生成報告，有就暫停[cite: 3]
+            // 🌟 核心防護：每一篇處理前，檢查是否有人在生成報告，有就暫停
             await waitUntilReportFinished(); 
 
             const batch = newArticles.slice(i, i + CONCURRENCY_LIMIT);
@@ -102,17 +103,21 @@ async function executeNewsETL(scraperModule, sourceName) {
 }
 
 // ==========================================
-// 🛠️ 全網新聞觸發器 (加入重複執行防護)
+// 🛠️ 全網新聞觸發器 (加入重複執行防護與補發機制)
 // ==========================================
 async function triggerAllETL() {
-    // 🌟 防護 1：如果有 ETL 正在進行，直接略過，避免重複啟動塞爆記憶體
+    // 🌟 防護 1：如果報告正在生成，直接標記「錯過抓取」並退出，報告完成後會立刻補抓
+    if (isReportGenerating) {
+        logger.warn('⏸️ [排程系統] 發現目前正在生成報告，本次 ETL 抓取任務延後，將於報告完成後立刻補抓。');
+        missedEtlDuringReport = true;
+        return;
+    }
+
+    // 🌟 防護 2：如果有 ETL 正在進行，直接略過，避免重複啟動塞爆記憶體
     if (isEtlRunning) {
         logger.warn('⚠️ [排程系統] 發現上一個 ETL 任務尚未結束，本次觸發自動忽略。');
         return;
     }
-
-    // 🌟 防護 2：如果報告正在生成，等待它結束後再開始
-    await waitUntilReportFinished();
 
     isEtlRunning = true; // 鎖上 ETL 狀態鎖
     
@@ -136,10 +141,13 @@ async function triggerAllETL() {
 // ==========================================
 logger.info('⏰ [排程器] 核心排程引擎已啟動，開始監控市場與資料流。');
 
-// 任務一：自動清理過期記憶 (每天凌晨 02:00 執行)
-cron.schedule('0 2 * * *', () => {
-    logger.info('🧹 [排程器] 觸發例行維護：開始清理過期新聞與孤兒標籤...');
-    db.cleanOldNews();
+// 任務一：自動清理過期記憶 (每 30 分鐘執行一次)
+cron.schedule('*/30 * * * *', () => {
+    logger.info('🧹 [排程器] 觸發例行維護：開始清理 15 小時前的過期新聞與孤兒標籤...');
+    // 傳入 15 代表只保留 15 小時內的數據
+    if (typeof db.cleanOldNews === 'function') {
+        db.cleanOldNews(15); 
+    }
 }, { timezone: "Asia/Taipei" });
 
 // 任務二：全網情報巡邏與 ETL (每 30 分鐘執行一次)
@@ -162,9 +170,16 @@ const reportSchedules = [
 
 reportSchedules.forEach(schedule => {
     cron.schedule(schedule.time, async () => {
+        
+        // 🌟 防護：如果上一份報告還卡在產製中，就放棄本次觸發，避免 AI 模型大塞車
+        if (isReportGenerating) {
+            logger.warn(`⚠️ [排程器] 系統目前仍有報告正在生成中，跳過本次報告觸發: 【${schedule.name}】`);
+            return;
+        }
+
         logger.info(`📢 [排程器] 觸發定時報告發布流程: 【${schedule.name}】`);
 
-        // 🌟 啟動報告生成鎖，這會讓所有正在運行的 ETL 暫停，新的 ETL 乖乖排隊[cite: 3]
+        // 🌟 啟動報告生成鎖，這會讓所有正在運行的 ETL 暫停，新的 ETL 乖乖排隊
         isReportGenerating = true; 
         
         try {
@@ -199,9 +214,16 @@ reportSchedules.forEach(schedule => {
         } catch (error) {
             logger.error(`❌ [排程器] 定時報告生成流程中斷: ${error.message}`);
         } finally {
-            // 🌟 報告生成結束，解除鎖定，讓暫停的 ETL 恢復運作[cite: 3]
+            // 🌟 報告生成結束，解除鎖定，讓暫停的 ETL 恢復運作
             isReportGenerating = false; 
             logger.info(`🔓 [排程器] 報告鎖定已解除，釋放算力。`);
+
+            // 🌟 如果報告期間錯過了排定的 ETL 任務，立刻啟動補發機制
+            if (missedEtlDuringReport) {
+                logger.info(`▶️ [排程系統] 偵測到報告期間有錯過的 ETL 任務，立即補抓新聞！`);
+                missedEtlDuringReport = false;
+                triggerAllETL(); 
+            }
         }
     }, { timezone: "Asia/Taipei" });
 });

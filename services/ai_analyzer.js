@@ -16,9 +16,39 @@ try {
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/generate';
 const MAX_TIMEOUT_MS = 1800000; // 30 分鐘超時保護
 
-// 輕重雙引擎配置
-const MODEL_8B = 'hf.co/Qwen/Qwen3-8B-GGUF:Q8_0'; 
-const MODEL_3B = 'hf.co/Qwen/Qwen3-4B-GGUF:Q8_0'; 
+// 輕重雙引擎配置 (依需求替換為輕量化模型以提升效能)
+const MODEL_8B = 'hf.co/Qwen/Qwen3-4B-GGUF:Q8_0'; 
+const MODEL_3B = 'qwen2.5:3b'; 
+
+// ==========================================
+// 🛠️ 專屬 JSON 解析防護網
+// ==========================================
+/**
+ * 解決 AI 經常輸出 Markdown 標記或不標準 JSON 的問題
+ */
+function safeParseJSON(rawResponse) {
+    try {
+        // 1. 先嘗試最直接的解析
+        return JSON.parse(rawResponse);
+    } catch (e) {
+        // 2. 清理常見的 Markdown 語法與頭尾廢話
+        let cleanText = rawResponse.replace(/```json/gi, '').replace(/```/g, '').trim();
+        const startIndex = cleanText.indexOf('{');
+        const endIndex = cleanText.lastIndexOf('}');
+        
+        if (startIndex !== -1 && endIndex !== -1 && endIndex >= startIndex) {
+            const jsonStr = cleanText.substring(startIndex, endIndex + 1);
+            try {
+                return JSON.parse(jsonStr);
+            } catch (err) {
+                // 3. 容錯處理：移除陣列或物件結尾多餘的逗號 (Trailing commas)
+                const fixedStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
+                return JSON.parse(fixedStr);
+            }
+        }
+        throw new Error("無法從 AI 回應中萃取出有效的 JSON 結構");
+    }
+}
 
 // ==========================================
 // 📖 字典載入與後處理機制 (解決代號對不上的問題)
@@ -213,7 +243,7 @@ ${newsCatalog}
 
 【強制輸出指令】：
 請根據上方資訊挑選潛力或危險股。只能輸出具體的「公司名稱」(如:緯創)。
-你現在是一台嚴格的 JSON 生成器，絕對禁止輸出任何前言、結語或 Markdown 標記。你只能且必須輸出符合以下格式的 JSON：
+你現在是一台嚴格的 JSON 生成器，絕對禁止輸出任何前言、結語或 Markdown 標記（如 \`\`\`json ）。你只能且必須輸出能被直接解析的 JSON 格式：
 {
   "market_view": "對新批次新聞與盤勢疊加的整體看法(20字)",
   "selections": [
@@ -233,17 +263,14 @@ ${newsCatalog}
 
             const rawResponse = response.data.response;
             
-            // 暴力的正則萃取，直接抓取 {}
-            let cleanJsonString = '';
-            const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
-            
-            if (jsonMatch) {
-                cleanJsonString = jsonMatch[0];
-            } else {
-                throw new Error("正則表達式找不到任何 JSON 大括號結構");
+            // 🌟 導入強健的 JSON 解析器
+            let parsedData;
+            try {
+                parsedData = safeParseJSON(rawResponse);
+            } catch (parseError) {
+                logger.warn(`  └─ ⚠️ 當前批次 JSON 解析失敗，原始 AI 回覆: ${rawResponse.substring(0, 100)}...`);
+                throw new Error("JSON 格式損壞且無法修復");
             }
-
-            const parsedData = JSON.parse(cleanJsonString);
             
             if (parsedData.market_view) aiMemory.marketView = parsedData.market_view;
             
@@ -267,12 +294,12 @@ ${newsCatalog}
                             });
                         }
                     } else if (!mappedSymbol) {
-                        logger.warn(`  └─ ⚠️ [字典過濾] AI 提出 "${item.name}"，但在字典中找不到代號，予以剔除。`);
+                        logger.warn(`  └─ ⚠️ [字典過濾] AI 提出 "${item.name}"，但在字典中找不到代號，予以剔除。`);
                     }
                 }
             }
         } catch (e) {
-            logger.warn(`  └─ ⚠️ 當前批次解析失敗: ${e.message}，自動跳過，不影響全局。`);
+            logger.warn(`  └─ ⚠️ 當前批次處理跳過: ${e.message}，不影響全局。`);
         }
     }
 
@@ -451,7 +478,7 @@ async function evaluateUserInput(userName, userInput, type) {
 【任務與強制約束】：
 1. 語系強制：必須且只能使用「繁體中文 (zh-TW)」撰寫點評，絕對禁止出現任何簡體字。
 2. 禁猜代號：你只能抓出「公司名稱」，絕對不准自己猜測或捏造股票代號。
-3. 輸出強制：你現在是一台嚴格的 JSON 生成器，只能輸出符合以下格式的 JSON：
+3. 輸出強制：你現在是一台嚴格的 JSON 生成器，絕對禁止輸出 Markdown 標記，只能輸出符合以下格式的純 JSON：
 
 {
   "company_name": "雙鴻",
@@ -470,19 +497,16 @@ async function evaluateUserInput(userName, userInput, type) {
             }, { timeout: MAX_TIMEOUT_MS });
             
             const rawResponse = response.data.response;
-            logger.info(`  └─ 🤖 [原始回覆預覽]: ${rawResponse.substring(0, 50)}...`);
+            logger.info(`  └─ 🤖 [原始回覆預覽]: ${rawResponse.substring(0, 50)}...`);
 
-            // 🌟 暴力的正則萃取
-            let cleanJsonString = '';
-            const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
-            
-            if (jsonMatch) {
-                cleanJsonString = jsonMatch[0];
-            } else {
-                throw new Error("找不到 JSON 結構");
+            // 🌟 導入強健的 JSON 解析器
+            let parsed;
+            try {
+                parsed = safeParseJSON(rawResponse);
+            } catch (parseError) {
+                logger.warn(`  └─ ⚠️ JSON 解析失敗，原始 AI 回覆: ${rawResponse.substring(0, 100)}...`);
+                throw new Error("無法解析出正確的 JSON 結構");
             }
-
-            const parsed = JSON.parse(cleanJsonString);
             
             // 🌟 核心修復：攔截 AI 抓出的公司名稱，交由我們的字典去查正確代號
             const compName = parsed.company_name || '未定';
@@ -510,4 +534,51 @@ async function evaluateUserInput(userName, userInput, type) {
     return instantEval;
 }
 
-module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput };
+/**
+ * 🌟 5. 新增：個股即時走勢速評 (走輕量模型，求快)
+ * 供 Discord !查 指令專用，結合 Market API 回傳之量化數據給出解讀
+ */
+async function quickAnalyzeStock(symbol, stockData) {
+    logger.info(`[AI 即時速評 - 3B] ⚡ 啟動 ${symbol} 走勢分析...`);
+    const startTime = Date.now();
+
+    // 將近 10 日的走勢陣列轉為文字
+    const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
+    
+    const prompt = `你是一位專業台美股分析師。請根據以下即時與歷史數據，給出一段簡潔有力的「個股速評」(大約 100-150 字)。
+【標的】：${stockData.name || symbol} (${symbol})
+【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
+【月線(20MA)均價】：${stockData.monthlyAvgPrice}
+【本益比】：${stockData.peRatio}
+
+【近 10 日歷史走勢】：
+${trendStr}
+
+【強制任務要求】：
+1. 判斷目前趨勢是多頭、空頭還是盤整。
+2. 點出現價與月線(20MA)的乖離關係 (例如：已跌破月線轉弱、或站穩月線具備支撐)。
+3. 語系強制使用「繁體中文 (zh-TW)」。
+4. 語氣客觀專業，直接給結論，不要廢話，不要 Markdown 大標題，直接輸出一段文字即可。`;
+
+    try {
+        const response = await axios.post(OLLAMA_URL, {
+            model: MODEL_3B, // 使用 3B 輕量引擎，確保能在幾秒內回應
+            prompt: prompt, 
+            stream: false, 
+            options: { temperature: 0.2, num_ctx: 1024 }
+        }, { timeout: 60000 }); // 1 分鐘超時保護
+
+        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+        logger.info(`[AI 即時速評 - 3B] ✅ 速評完成 (耗時: ${duration}s)`);
+        
+        // 組合最終回傳文字，附上整理好的基礎報價數據
+        const baseInfo = `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n**📊 本益比 (PE)**：${stockData.peRatio}\n\n`;
+        return baseInfo + `**💡 AI 走勢解讀：**\n${response.data.response.trim()}`;
+
+    } catch (error) {
+        logger.error(`[AI 即時速評 - 3B] ❌ 速評失敗: ${error.message}`);
+        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n\n⚠️ 系統提示：AI 走勢解讀模組暫時離線或回應超時。`;
+    }
+}
+
+module.exports = { addPendingQA, summarizeNews, generateMarketReport, evaluateUserInput, quickAnalyzeStock };

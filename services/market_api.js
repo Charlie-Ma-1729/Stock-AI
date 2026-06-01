@@ -1,4 +1,4 @@
-// market_api.js
+// services/market_api.js
 // ==========================================================================
 // 🌟 [修復]: 依照 v2 最新規範執行實例化，並傳入 suppressNotices 徹底壓制問卷提示
 // ==========================================================================
@@ -150,6 +150,58 @@ async function fetchTargetsData(targets, symbols) {
 }
 
 /**
+ * 📈 模組 5：個股即時走勢與報價速查 (供 Discord !查 指令使用)
+ * 智能判斷台美股，並抓取近 1 個月歷史收盤價，計算月線(20MA)供 AI 判讀
+ */
+async function fetchStockTrend(rawSymbol) {
+    // 智能判斷：若字串全是數字，或數字開頭加上英文字母(如 00981A)，且沒有小數點，自動加上 .TW 視為台股
+    let symbol = rawSymbol.toUpperCase();
+    if (/^\d{4,6}[A-Z]?$/.test(symbol)) {
+        symbol = `${symbol}.TW`;
+    }
+
+    logger.info(`🔍 [Market API] 啟動即時查價，目標標的: ${symbol}...`);
+    try {
+        // 1. 抓取即時報價
+        const quote = await yahooFinance.quote(symbol);
+        
+        // 2. 抓取歷史走勢 (近 30 天)
+        const period1 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); 
+        const historical = await yahooFinance.historical(symbol, { period1 });
+        
+        // 3. 整理近期的收盤價走勢 (提取近 10 個交易日供 AI 速評)
+        const recentTrend = historical.slice(-10).map(day => ({
+            date: day.date.toISOString().split('T')[0], // 轉為 YYYY-MM-DD
+            close: day.close.toFixed(2),
+            volume: day.volume
+        }));
+
+        // 4. 計算月線簡單均價 (20MA) 作為趨勢支撐/壓力參考
+        const closes = historical.map(d => d.close);
+        const monthlyAvg = closes.length > 0 ? (closes.reduce((sum, val) => sum + val, 0) / closes.length).toFixed(2) : 'N/A';
+
+        logger.info(`✅ [Market API] 成功獲取 ${symbol} 走勢資料，現價: ${quote.regularMarketPrice}`);
+        
+        return {
+            symbol: symbol,
+            name: quote.shortName || quote.longName || symbol,
+            currentPrice: quote.regularMarketPrice,
+            change: quote.regularMarketChange,
+            changePercent: (quote.regularMarketChangePercent || 0).toFixed(2) + '%',
+            volume: quote.regularMarketVolume,
+            peRatio: quote.trailingPE ? quote.trailingPE.toFixed(2) : 'N/A',
+            fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,
+            fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
+            monthlyAvgPrice: monthlyAvg,
+            recentTrend: recentTrend
+        };
+    } catch (error) {
+        logger.error(`❌ [Market API] 獲取 ${symbol} 走勢失敗: ${error.message}`);
+        return { error: true, message: error.message };
+    }
+}
+
+/**
  * 🚀 統整輸出市場快照
  */
 async function getMarketSnapshot(includeInstitutional = false, includeTwStock = true) {
@@ -173,4 +225,4 @@ async function getMarketSnapshot(includeInstitutional = false, includeTwStock = 
     return snapshot;
 }
 
-module.exports = { getMarketSnapshot, fetchTargetsData };
+module.exports = { getMarketSnapshot, fetchTargetsData, fetchStockTrend };
