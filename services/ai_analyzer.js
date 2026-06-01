@@ -82,24 +82,9 @@ function loadDictionaries() {
 }
 loadDictionaries();
 
-function mapNameToSymbol(name) {
-    if (!name) return null;
-    if (stockDict[name]) return stockDict[name];
-    
-    for (const [dictName, symbol] of Object.entries(stockDict)) {
-        if (dictName.length >= 2) {
-            if (name.includes(dictName) || dictName.includes(name)) {
-                return symbol;
-            }
-        }
-    }
-    return null;
-}
-
 function getChineseNameBySymbol(targetSymbol) {
     if (!targetSymbol) return null;
     const cleanTarget = targetSymbol.replace(/\.TW|\.TWO/gi, '').toUpperCase();
-    
     for (const [name, sym] of Object.entries(stockDict)) {
         const cleanSym = sym.replace(/\.TW|\.TWO/gi, '').toUpperCase();
         if (cleanSym === cleanTarget) {
@@ -110,7 +95,6 @@ function getChineseNameBySymbol(targetSymbol) {
 }
 
 const qaFilePath = path.join(__dirname, '../output/pending_qa.json');
-
 function addPendingQA(user, question, evaluation = '', type = 'question') {
     let qaList = [];
     if (fs.existsSync(qaFilePath)) {
@@ -121,60 +105,96 @@ function addPendingQA(user, question, evaluation = '', type = 'question') {
     fs.writeFileSync(qaFilePath, JSON.stringify(qaList, null, 2));
 }
 
+/**
+ * 🌟 RAG 智能觀點探討 (!觀點)
+ * 會抓取使用者敘述的關鍵字去找新聞，並結合報價一起回應。
+ */
 async function evaluateUserInput(userName, userInput, type) {
-    let instantEval = '';
-    if (type === 'viewpoint') {
-        const prompt = `你現在是一位精通台股暗語的主力操盤手。
-用戶發表了一段含糊的市場觀察：「${userInput}」。
+    if (type !== 'viewpoint') return '';
 
-【任務與強制約束】：
-1. 語系強制：必須且只能使用「繁體中文 (zh-TW)」撰寫點評，絕對禁止出現任何簡體字。
-2. 禁猜代號：你只能抓出「公司名稱」，絕對不准自己猜測或捏造股票代號。
-3. 輸出強制：你現在是一台嚴格的 JSON 生成器，絕對禁止輸出 Markdown 標記，只能輸出符合以下格式的純 JSON：
-
+    logger.info(`[AI 觀點探索 - 8B] 🕵️ 正在解析散戶 (${userName}) 的發言意圖...`);
+    const startTime = Date.now();
+    
+    try {
+        // 階段 1：萃取關鍵字
+        const extractPrompt = `請從以下用戶發言中，萃取出 2~4 個最重要的「實體名詞」或「事件關鍵字」（例如人名、公司名、產品名、事件）。
+用戶發言：「${userInput}」
+你現在是一台嚴格的 JSON 生成器，只能輸出符合以下格式的純 JSON：
 {
-  "company_name": "雙鴻",
-  "evaluation": "以 60 字內犀利點出該觀點是否有「情緒過熱/盲目跟風」或「具備反身性深思考」的特質。"
+  "keywords": ["關鍵字1", "關鍵字2"]
 }`;
         
-        const startTime = Date.now();
+        const extractRes = await axios.post(OLLAMA_URL, {
+            model: MODEL_8B, prompt: extractPrompt, stream: false, format: 'json', options: { temperature: 0.1, num_ctx: 1024 }
+        }, { timeout: MAX_TIMEOUT_MS });
+        
+        let keywords = [];
         try {
-            const response = await axios.post(OLLAMA_URL, {
-                model: MODEL_8B, 
-                prompt, 
-                stream: false, 
-                format: 'json', 
-                options: { temperature: 0.1, num_ctx: 2048 }
-            }, { timeout: MAX_TIMEOUT_MS });
-            
-            const rawResponse = response.data.response;
-            
-            let parsed;
-            try {
-                parsed = safeParseJSON(rawResponse);
-            } catch (parseError) {
-                throw new Error("無法解析出正確的 JSON 結構");
-            }
-            
-            const compName = parsed.company_name || '未定';
-            let finalTargetDisplay = compName;
-            
-            if (compName !== '未定') {
-                const mappedSymbol = mapNameToSymbol(compName);
-                if (mappedSymbol) {
-                    finalTargetDisplay = `${compName} (${mappedSymbol})`; 
-                }
-            }
-
-            instantEval = `🎯 **標的識別**：${finalTargetDisplay}\n💡 **觀點速評**：${parsed.evaluation || '無'}`;
-        } catch (error) {
-            logger.error(`[AI 情緒與個股識別 - 8B] ❌ 評估失敗: ${error.message}`);
-            instantEval = '個股模糊識別離線，暫無初步評估';
+            keywords = safeParseJSON(extractRes.data.response).keywords || [];
+        } catch (e) {
+            logger.warn('關鍵字萃取 JSON 失敗，改用原句切割');
+            keywords = userInput.split(' ').slice(0, 3);
         }
+
+        logger.info(`[AI 觀點探索 - 8B] 🔍 萃取關鍵字: [${keywords.join(', ')}]，準備檢索新聞庫...`);
+
+        // 階段 2：資料庫新聞檢索與代號提取
+        let relatedNews = [];
+        let uniqueSymbols = new Set();
+        if (keywords.length > 0) {
+            relatedNews = db.searchNewsByGeneralKeywords(keywords, 5); // 抓 5 篇相關新聞
+            relatedNews.forEach(n => {
+                if (n.symbols) n.symbols.forEach(s => uniqueSymbols.add(s));
+            });
+        }
+
+        // 階段 3：獲取關聯標的之即時報價
+        let marketDataStr = '目前無特定關聯的股票報價。';
+        const symbolsArr = Array.from(uniqueSymbols).slice(0, 5); // 最多查 5 檔
+        if (symbolsArr.length > 0 && marketApi) {
+            const quotes = await marketApi.fetchTargetsData(symbolsArr, symbolsArr);
+            marketDataStr = Object.values(quotes).map(q => typeof q === 'string' ? q : `- ${q.name}(${q.symbol}): 現價 ${q.price} (${q.changePercent})`).join('\n');
+            logger.info(`[AI 觀點探索 - 8B] 📈 成功獲取關聯標的報價: ${symbolsArr.join(', ')}`);
+        }
+
+        // 階段 4：綜合回答
+        const newsStr = relatedNews.length > 0 ? relatedNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n內文: ${n.content.substring(0, 300)}...`).join('\n\n') : '無相關新聞。';
+
+        const evalPrompt = `你是一位專業且具備反身性思考的台美股分析師。
+用戶（${userName}）發表了以下觀點或提問：「${userInput}」
+
+我們從系統資料庫中，透過關鍵字 [${keywords.join(', ')}] 找到了以下關聯資訊：
+
+【相關新聞】：
+${newsStr}
+
+【相關標的即時報價】：
+${marketDataStr}
+
+【強制任務要求】：
+1. 請「直接且明確地」回答或點評使用者的觀點與疑問。
+2. 請善用上方提供的「相關新聞」與「即時報價」來佐證你的看法。若有提到具體股票，請幫忙分析一下目前的位階狀態。
+3. 若資料庫沒有新聞，請單純依據你的常識與邏輯回覆。
+4. 語系強制使用「繁體中文 (zh-TW)」。
+5. 語氣像是一位有經驗的導師，請直接給出結論，不要 Markdown 大標題，字數約 300 字以內。`;
+
+        const evalRes = await axios.post(OLLAMA_URL, {
+            model: MODEL_8B, prompt: evalPrompt, stream: false, options: { temperature: 0.3, num_ctx: 8192 }
+        }, { timeout: MAX_TIMEOUT_MS });
+        
+        const evaluation = evalRes.data.response.trim();
+        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+        logger.info(`[AI 觀點探索 - 8B] ✅ 探討完成 (耗時: ${duration}s)`);
+
+        let instantEval = `🎯 **AI 觀點深度探討** (檢索關鍵字: ${keywords.join(', ')})\n\n${evaluation}`;
+        
+        addPendingQA(userName, userInput, evaluation, type);
+        return instantEval;
+
+    } catch (error) {
+        logger.error(`[AI 觀點探索 - 8B] ❌ 評估失敗: ${error.message}`);
+        return '⚠️ 系統提示：觀點探討模組暫時離線或回應超時。';
     }
-    
-    addPendingQA(userName, userInput, instantEval, type);
-    return instantEval;
 }
 
 async function quickAnalyzeStock(symbol, stockData) {
@@ -182,7 +202,6 @@ async function quickAnalyzeStock(symbol, stockData) {
     const startTime = Date.now();
 
     const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
-    
     const allRecentNews = db.getRecentNews(48);
     const cleanSymbol = symbol.replace(/\.TW|\.TWO/gi, ''); 
     const chineseName = getChineseNameBySymbol(symbol); 
@@ -191,7 +210,6 @@ async function quickAnalyzeStock(symbol, stockData) {
     const relatedNews = allRecentNews.filter(news => {
         const symbolStr = (news.symbols || news.tags || '').toString();
         const matchSymbol = symbolStr.includes(cleanSymbol);
-        // 🌟 核心修改：判斷是否命中 content 
         const matchChineseName = chineseName && (news.title.includes(chineseName) || (news.content && news.content.includes(chineseName)));
         const matchName = stockName && (news.title.includes(stockName) || (news.content && news.content.includes(stockName)));
         const matchCleanName = news.title.includes(cleanSymbol) || (news.content && news.content.includes(cleanSymbol));
@@ -200,8 +218,7 @@ async function quickAnalyzeStock(symbol, stockData) {
 
     let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
     if (relatedNews.length > 0) {
-        // 🌟 核心修改：輸出完整的 n.content 而不是 n.summary
-        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n內文: ${n.content}`).join('\n\n');
+        newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n內文: ${n.content.substring(0, 500)}...`).join('\n\n');
     }
 
     const prompt = `你是一位專業台美股分析師。請根據以下即時數據、歷史走勢與近期新聞，給出一段簡潔有力的「個股速評」(大約 150-200 字)。
@@ -225,10 +242,7 @@ ${newsContext}
 
     try {
         const response = await axios.post(OLLAMA_URL, {
-            model: MODEL_3B, 
-            prompt: prompt, 
-            stream: false, 
-            options: { temperature: 0.2, num_ctx: 4096 } // 🌟 放大 3B 模型的記憶體以容納完整新聞
+            model: MODEL_3B, prompt: prompt, stream: false, options: { temperature: 0.2, num_ctx: 4096 } 
         }, { timeout: MAX_TIMEOUT_MS });
 
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -239,12 +253,15 @@ ${newsContext}
 
     } catch (error) {
         logger.error(`[AI 即時速評 - 3B] ❌ 速評失敗: ${error.message}`);
-        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n**📈 月線 (20MA)**：${stockData.monthlyAvgPrice}\n\n⚠️ 系統提示：AI 走勢解讀模組暫時離線或回應超時。`;
+        return `**💰 現價**：${stockData.currentPrice} (${stockData.changePercent})\n\n⚠️ 系統提示：AI 走勢解讀模組暫時離線或回應超時。`;
     }
 }
 
-async function detailedAnalyzeStock(symbol, stockData) {
-    logger.info(`[AI 深度詳查 - 8B] 🧠 啟動 ${symbol} 深度解析...`);
+/**
+ * 🌟 深度詳查報告 (!詳查) - 支援回答使用者提問
+ */
+async function detailedAnalyzeStock(symbol, stockData, userInput = '') {
+    logger.info(`[AI 深度詳查 - 8B] 🧠 啟動 ${symbol} 深度解析... (附帶用戶提問: ${userInput})`);
     const startTime = Date.now();
 
     const trendStr = (stockData.recentTrend || []).map(t => `${t.date}: 收盤 ${t.close}, 成交量 ${t.volume}`).join('\n');
@@ -257,7 +274,6 @@ async function detailedAnalyzeStock(symbol, stockData) {
     const relatedNews = allRecentNews.filter(news => {
         const symbolStr = (news.symbols || news.tags || '').toString();
         const matchSymbol = symbolStr.includes(cleanSymbol);
-        // 🌟 核心修改：判斷是否命中 content 
         const matchChineseName = chineseName && (news.title.includes(chineseName) || (news.content && news.content.includes(chineseName)));
         const matchName = stockName && (news.title.includes(stockName) || (news.content && news.content.includes(stockName)));
         const matchCleanName = news.title.includes(cleanSymbol) || (news.content && news.content.includes(cleanSymbol));
@@ -266,16 +282,23 @@ async function detailedAnalyzeStock(symbol, stockData) {
 
     let newsContext = '目前資料庫中無該標的之近期關聯新聞。';
     if (relatedNews.length > 0) {
-        // 🌟 核心修改：輸出完整的 n.content
         newsContext = relatedNews.map((n, i) => `[新聞 ${i + 1}] ${n.title}\n內文: ${n.content}`).join('\n\n');
     }
 
-    const prompt = `你是一位深諳反身性與行為金融學的台美股資深操盤手。請根據以下量價數據與近期新聞，為這檔股票寫一份「深度詳查報告」(約 300-500 字)。
+    // 🌟 核心修改：把使用者的問題強制置入 Prompt
+    let userContextPrompt = '';
+    if (userInput) {
+        userContextPrompt = `\n【使用者的疑問 / 觀點陳述】：\n「${userInput}」\n\n`;
+    }
+
+    const prompt = `你是一位深諳反身性與行為金融學的台美股資深操盤手。請根據以下量價數據與近期新聞，為這檔股票寫一份「深度詳查報告」(約 400-500 字)。
 【標的】：${chineseName || stockName} (${symbol})
 【即時報價】：${stockData.currentPrice} (${stockData.changePercent})
 【月線(20MA)均價】：${stockData.monthlyAvgPrice}
 【本益比】：${stockData.peRatio}
 【52週高低點】：高 ${stockData.fiftyTwoWeekHigh} / 低 ${stockData.fiftyTwoWeekLow}
+
+${userContextPrompt}
 
 【近 10 日歷史走勢】：
 ${trendStr}
@@ -284,18 +307,19 @@ ${trendStr}
 ${newsContext}
 
 【強制任務要求】：
+0. 如果有提供【使用者的疑問 / 觀點陳述】，請務必在報告開頭第一段「直接且具體地」回答他的疑問或點評他的觀點！
 1. 籌碼與技術面判讀：判斷目前多空趨勢、現價與月線的乖離、支撐與壓力區在哪。
-2. 消息面與基本面共振：詳細解讀「近期相關新聞」中的利多或利空，並判斷市場是否已經反映（利多出盡或利空出盡）。如果無新聞，則跳過此項。
-3. 操作建議與風險預警：給出具體的短線或波段操作思維，並明確點出破局停損點或追高風險。
+2. 消息面與基本面共振：詳細解讀「近期相關新聞」中的利多或利空，並判斷市場是否已經反映。
+3. 操作建議與風險預警：明確點出破局停損點或追高風險。
 4. 語系強制使用「繁體中文 (zh-TW)」。
-5. 專業且嚴謹，不要使用過度浮誇的詞彙，請直接以 Markdown 格式排版輸出整齊的報告。`;
+5. 直接以 Markdown 格式排版輸出整齊的報告。`;
 
     try {
         const response = await axios.post(OLLAMA_URL, {
             model: MODEL_8B, 
             prompt: prompt, 
             stream: false, 
-            options: { temperature: 0.3, num_ctx: 8192 } // 🌟 放大 8B 模型記憶體至 8192，避免 10 篇新聞塞爆
+            options: { temperature: 0.3, num_ctx: 8192 } 
         }, { timeout: MAX_TIMEOUT_MS });
 
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);

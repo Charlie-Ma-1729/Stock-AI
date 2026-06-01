@@ -76,7 +76,6 @@ const stmts = {
         ORDER BY a.published_at DESC
     `),
     
-    // 🌟 核心修改：改為在 a.content (完整內文) 裡面進行模糊搜尋
     searchNewsByKeyword: db.prepare(`
         SELECT a.url, a.title, a.summary, a.content, GROUP_CONCAT(m.symbol) as symbols
         FROM articles a
@@ -135,6 +134,38 @@ function searchNewsByKeyword(stockName, symbol, limit = 15) {
         }));
     } catch (err) {
         logger.error(`❌ [DB] 檢索專屬新聞失敗: ${err.message}`);
+        return [];
+    }
+}
+
+/**
+ * 🌟 [全新功能] 多重關鍵字廣泛檢索 (供 !觀點 使用)
+ */
+function searchNewsByGeneralKeywords(keywords, limit = 5) {
+    if (!keywords || keywords.length === 0) return [];
+    
+    // 動態組合 SQL：(title LIKE ? OR content LIKE ?) OR ...
+    const conditions = keywords.map(() => `(a.title LIKE ? OR a.content LIKE ?)`).join(' OR ');
+    const params = keywords.flatMap(k => [`%${k}%`, `%${k}%`]);
+    
+    const sql = `
+        SELECT a.url, a.title, a.summary, a.content, GROUP_CONCAT(m.symbol) as symbols
+        FROM articles a
+        LEFT JOIN stock_news_map m ON a.url = m.article_url
+        WHERE ${conditions}
+        GROUP BY a.url
+        ORDER BY a.published_at DESC
+        LIMIT ?
+    `;
+    
+    try {
+        const rows = db.prepare(sql).all(...params, limit);
+        return rows.map(row => ({
+            ...row,
+            symbols: row.symbols ? row.symbols.split(',') : []
+        }));
+    } catch (err) {
+        logger.error(`❌ [DB] 關鍵字新聞檢索失敗: ${err.message}`);
         return [];
     }
 }
@@ -211,6 +242,7 @@ module.exports = {
     saveNewsWithTags,
     getRecentNews,
     searchNewsByKeyword,
+    searchNewsByGeneralKeywords, // 匯出新功能
     cleanOldNews, 
     savePrediction,
     getDuePredictions,
