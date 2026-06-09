@@ -204,11 +204,16 @@ client.on('messageCreate', async (message) => {
             const args = rawQuery.split(/\s+/);
             const targetStock = args[0];
 
+            // 🌟 完美破解 market_api 雙向字典 Bug 機制：
+            // 如果用戶輸入代號(如 6116)，我們先把它轉成中文(彩晶)傳過去
+            // market_api 收到中文後，就會乖乖把它再轉回代號(6116)去查 Yahoo，藉此避開找不到資料的錯誤！
+            const lookupStock = allStocks[targetStock] || targetStock;
+
             const waitMsg = await message.reply(`⏳ **系統正在抓取 ${targetStock} 的最新市場報價與 AI 運算中，請稍候...**`);
             
             try {
-                // 只將 `targetStock` (如 6116 或 奇鋐) 交給報價系統，避免 Yahoo 搜尋不到報錯
-                const stockData = await marketApi.fetchStockTrend(targetStock);
+                // 將經過處理的 `lookupStock` 交給報價系統
+                const stockData = await marketApi.fetchStockTrend(lookupStock);
 
                 if (stockData.error) {
                     return waitMsg.edit(`❌ 無法獲取 **${targetStock}** 的報價資料，請確認名稱或代號是否正確 (問問題請記得加空白隔開)。\n詳細訊息: ${stockData.message}`);
