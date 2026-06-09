@@ -146,7 +146,7 @@ client.once('clientReady', async () => {
     // 2. 🌟 設定每 2 小時重新抓取一次最新熱門股，確保清單與市場動向同步
     setInterval(fetchTrendingStocks, 2 * 60 * 60 * 1000);
 
-    // 3. 啟動走馬燈 (每3秒) 與頻道主題更新 (每10分)
+    // 3. 啟觸發馬燈 (每3秒) 與頻道主題更新 (每10分)
     setInterval(updateTickerStatus, 3 * 1000);
     setInterval(updateChannelTopic, 10 * 60 * 1000);
 });
@@ -194,23 +194,28 @@ client.on('messageCreate', async (message) => {
         // 功能二：深度詳查與報價 (!查)
         // --------------------------------------------------
         else if (content.startsWith('!查 ')) {
-            const query = content.replace('!查 ', '').trim();
-            if (!query) {
-                return message.reply('⚠️ 請輸入你想詳查的股票代號或關鍵字！(例如：!查 台積電)');
+            const rawQuery = content.replace('!查 ', '').trim();
+            if (!rawQuery) {
+                return message.reply('⚠️ 請輸入你想詳查的股票代號或關鍵字！(例如：!查 台積電 該買嗎)');
             }
 
-            const waitMsg = await message.reply('⏳ **系統正在抓取最新市場報價與 AI 運算中，請稍候...**');
+            // 🌟 核心修復：用空白切割指令。第一個字詞當作股票標的，後續視為問題。
+            // 例如 "6116 現在很多人在賣..." -> targetStock 變成 "6116"
+            const args = rawQuery.split(/\s+/);
+            const targetStock = args[0];
+
+            const waitMsg = await message.reply(`⏳ **系統正在抓取 ${targetStock} 的最新市場報價與 AI 運算中，請稍候...**`);
             
             try {
-                // 🌟 關鍵修復：必須先去 marketApi 拿真實報價，解決 undefined 問題！
-                const stockData = await marketApi.fetchStockTrend(query);
+                // 只將 `targetStock` (如 6116 或 奇鋐) 交給報價系統，避免 Yahoo 搜尋不到報錯
+                const stockData = await marketApi.fetchStockTrend(targetStock);
 
                 if (stockData.error) {
-                    return waitMsg.edit(`❌ 無法獲取 ${query} 的報價資料，請確認名稱或代號是否正確。\n詳細訊息: ${stockData.message}`);
+                    return waitMsg.edit(`❌ 無法獲取 **${targetStock}** 的報價資料，請確認名稱或代號是否正確 (問問題請記得加空白隔開)。\n詳細訊息: ${stockData.message}`);
                 }
 
-                // 呼叫改版後的 AI 分析器，並把剛剛抓到的 stockData 餵給它
-                const analysisResult = await ai_analyzer.detailedAnalyzeStock(stockData.symbol, stockData, query); 
+                // 呼叫分析器，把剛剛抓到的 stockData，連同用戶「完整的原始問題 (rawQuery)」一起餵給 AI
+                const analysisResult = await ai_analyzer.detailedAnalyzeStock(stockData.symbol, stockData, rawQuery); 
 
                 if (analysisResult.length > 1900) {
                     await waitMsg.delete(); 
