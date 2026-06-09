@@ -28,6 +28,7 @@ function parseDictionary(data) {
                 // 移除原有的 .TW 或 .TWO，保留純代號
                 const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
                 stockLookupMap[name.toString().trim()] = cleanSym; 
+                stockLookupMap[cleanSym] = name.toString().trim(); // 反向映射也存一份，供走馬燈使用
             }
         });
     } else if (typeof data === 'object') {
@@ -41,6 +42,7 @@ function parseDictionary(data) {
             }
             const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
             stockLookupMap[name.toString().trim()] = cleanSym;
+            stockLookupMap[cleanSym] = name.toString().trim();
         }
     }
 }
@@ -305,4 +307,68 @@ async function getMarketSnapshot(includeInstitutional = false, includeTwStock = 
     return snapshot;
 }
 
-module.exports = { getMarketSnapshot, fetchTargetsData, fetchStockTrend };
+/**
+ * 🚀 新功能：從 Yahoo Finance 獲取熱門股票 (Trending) 
+ * 供系統初始化儲存熱門股備用
+ */
+async function getTrendingSymbols() {
+    try {
+        const result = await yahooFinance.trendingSymbols('TW');
+        if (result && result.quotes) {
+            return result.quotes.map(q => q.symbol).filter(Boolean);
+        }
+        return ['2330.TW', '2317.TW', '2454.TW'];
+    } catch (error) {
+        logger.warn(`獲取熱門股失敗，使用預設備用名單。原因: ${error.message}`);
+        // 回退至預設的台美股熱門標的
+        return ['2330.TW', '2454.TW', '0050.TW', 'NVDA', 'TSLA', 'AAPL'];
+    }
+}
+
+/**
+ * 🚀 新功能：批量獲取股票報價，並格式化為 Discord 走馬燈字串
+ * 格式範例：台積電 2,355.00▲30.00      旺宏 143.0▼13.50
+ */
+async function getFormattedQuotes(symbols, customDictionary = {}) {
+    if (!symbols || symbols.length === 0) return "暫無數據";
+
+    try {
+        const quotes = await yahooFinance.quote(symbols);
+        const quotesArray = Array.isArray(quotes) ? quotes : [quotes];
+
+        const formattedStrings = quotesArray.map(quote => {
+            if (!quote || !quote.regularMarketPrice) return null;
+
+            const symbol = quote.symbol;
+            const pureSym = symbol.split('.')[0];
+            
+            // 嘗試從外部傳入字典、內部 stockLookupMap 尋找名稱，找不到則使用代號
+            let name = customDictionary[symbol] || customDictionary[pureSym] || stockLookupMap[pureSym] || stockLookupMap[symbol] || pureSym;
+            
+            const price = quote.regularMarketPrice.toFixed(2);
+            const change = quote.regularMarketChange || 0;
+            
+            const changeIcon = change >= 0 ? '▲' : '▼';
+            const changeValue = Math.abs(change).toFixed(2);
+
+            return `${name} ${price}${changeIcon}${changeValue}`;
+        }).filter(Boolean);
+
+        return formattedStrings.join('      ');
+    } catch (error) {
+        logger.error(`獲取走馬燈報價發生錯誤: ${error.message}`);
+        return "報價連線異常";
+    }
+}
+
+module.exports = { 
+    getMarketSnapshot, 
+    fetchTargetsData, 
+    fetchStockTrend,
+    getGlobalIndices,
+    getTaiwanStocksRealtime,
+    getInstitutionalInvestors,
+    getTrendingSymbols,
+    getFormattedQuotes,
+    stockLookupMap 
+};
