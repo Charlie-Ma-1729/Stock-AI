@@ -25,28 +25,33 @@ async function evaluatePrediction(prediction) {
     const timeString = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei', hour12: false });
 
     let marketContext = '⚠️ 無法取得即時走勢與市場詳細數據';
+    let stockName = prediction.symbol;
 
     if (marketApi) {
+        // 嘗試從字典反查名稱
+        const pureSym = prediction.symbol.replace(/\.TW|\.TWO/gi, '');
+        if (marketApi.stockLookupMap && marketApi.stockLookupMap[pureSym]) {
+            stockName = marketApi.stockLookupMap[pureSym];
+        }
+
         try {
-            // 呼叫最新版 market_api.js 的 fetchStockTrend，獲取極度詳細的盤勢數據
+            // 呼叫最新版 market_api.js 的 fetchStockTrend，獲取盤勢數據
             const stockData = await marketApi.fetchStockTrend(prediction.symbol);
             
             if (!stockData.error) {
-                // 組合帶有成交量的近 10 日走勢
-                const trendStr = (stockData.recentTrend || []).map(t => 
-                    `${t.date}: 收盤價 ${t.close} (成交量: ${t.volume || '未知'})`
+                stockName = stockData.name || stockName; // 確保拿到最正確的中文名稱
+
+                // 組合帶有成交量的近 5 日走勢 (縮短篇幅，不需要看到 10 天)
+                const trendStr = (stockData.recentTrend || []).slice(-5).map(t => 
+                    `${t.date}: 收 ${t.close}`
                 ).join('\n');
 
-                // 結合月線、本益比、52週高低點等深度數據
+                // 結合月線、本益比等深度數據，精簡化提供給 AI
                 marketContext = `
-【目前市場最新狀態】
-- 標的名稱：${stockData.name || prediction.symbol}
-- 最新收盤價：${stockData.currentPrice || 'N/A'} (${stockData.changePercent || 'N/A'})
-- 20日均價(月線)：${stockData.monthlyAvgPrice || 'N/A'}
-- 本益比(PE)：${stockData.peRatio || 'N/A'}
-- 52週高低點區間：${stockData.fiftyTwoWeekLow || 'N/A'} ~ ${stockData.fiftyTwoWeekHigh || 'N/A'}
-
-【近 10 日實際量價走勢】：
+【最新市場數據】
+- 現價：${stockData.price || stockData.currentPrice} (${stockData.changePercent})
+- 月線(20MA)：${stockData.monthlyAvgPrice}
+- 近 5 日走勢：
 ${trendStr}
                 `.trim();
             } else {
@@ -57,33 +62,33 @@ ${trendStr}
         }
     }
 
-    // 針對新的資料庫欄位，取得當初的預測文字 (相容 prediction_text 或 reasoning)
+    // 取得當初的預測文字
     const originalPrediction = prediction.prediction_text || prediction.reasoning || '無紀錄';
 
+    // 🌟 核心修改：嚴格限制字數，強制 AI 只講重點
     const reviewPrompt = `
-現在時間是 ${timeString}。這是一週前你（AI 分析師）對【${prediction.symbol}】做出的分析預測。
-請根據一週前你的預言，對比這幾天的實際量價走勢與目前的市場基本面數據，給出極度嚴格且客觀的「殘酷對帳與反省」。
+時間：${timeString}。這是一週前你對【${stockName} (${prediction.symbol})】做出的投資建議。
 
-【一週前的 AI 預測內容】：
+【一週前的 AI 建議】：
 ${originalPrediction}
 
 ${marketContext}
 
-請以繁體中文 (zh-TW)，給出一份詳細的量化檢討報告，必須包含以下結構與標題：
-1. 🎯 預測準確度評分 (滿分 10 分，請嚴格評分，不可自我寬容)
-2. 🔍 覆盤檢討 (當時看對或看錯的關鍵盲點在哪？市場是否發生了未預期的反轉？乖離率是否過大？)
-3. 📈 現狀解讀與建議 (結合目前的月線、本益比與近期走勢，現在該標的處於什麼位階？建議停損、續抱還是加碼？)
-4. 💡 經驗學習 (將這次的成功或失敗教訓，濃縮成一句深刻的交易法則)
+請以「繁體中文」給出一份極度精簡的「殘酷覆盤」(總字數嚴格控制在 150 字以內)，請直接輸出以下四點，不要廢話：
+1. 🎯 評分：(1-10分，嚴格評分)
+2. 🔍 檢討：(一句話點出當時看對或看錯的關鍵)
+3. 📈 建議：(現階該停損、續抱還是加碼？)
+4. 💡 教訓：(一句話總結經驗)
     `;
 
     try {
         const response = await axios.post(OPENROUTER_URL, {
             model: MODEL_NAME,
             messages: [
-                { role: 'system', content: '你是一位極度嚴格、不留情面的華爾街量化檢討專家與風控主管。' },
+                { role: 'system', content: '你是一位講話極度精簡、一針見血的華爾街量化檢討專家與風控主管。' },
                 { role: 'user', content: reviewPrompt }
             ],
-            temperature: 0.3
+            temperature: 0.2 // 調低溫度讓 AI 回答更具體、不發散
         }, {
             headers: {
                 'Authorization': `Bearer ${API_KEY}`,
@@ -95,24 +100,24 @@ ${marketContext}
 
         const lessonText = response.data.choices[0].message.content.trim();
 
-        // 🌟 串接新版 db.js：將檢討結果化為向量 (Vector) 刻入神經網路記憶體，供未來 RAG 檢索
+        // 串接新版 db.js：將檢討結果化為向量 (Vector) 刻入神經網路記憶體
         if (typeof db.saveVectorMemory === 'function') {
             await db.saveVectorMemory(lessonText, { 
                 predictionId: prediction.id, 
                 symbol: prediction.symbol,
+                name: stockName,
                 type: 'night_review_lesson',
                 score_extracted: 'Auto-Evaluated'
             });
             logger.info(`🧠 預言 [ID: ${prediction.id}] 的教訓已刻入 Vectra 向量神經網。`);
-        } else {
-            logger.warn('⚠️ 找不到 db.saveVectorMemory 函數，跳過向量記憶庫寫入。');
         }
 
         // 標記為已覆盤
         db.markPredictionEvaluated(prediction.id);
-        logger.info(`✅ 預言 [ID: ${prediction.id}] 已結案。`);
+        logger.info(`✅ 預言 [ID: ${prediction.id} - ${stockName}] 已結案。`);
 
-        return lessonText;
+        // 回傳前包裝好標題，確保 Discord 輸出美觀且有明確股名
+        return `### 🏷️ 覆盤標的：【${stockName} (${prediction.symbol})】\n${lessonText}`;
 
     } catch (error) {
         if (error.response) {
@@ -120,7 +125,7 @@ ${marketContext}
         } else {
             logger.error(`❌ 覆盤發生錯誤: ${error.message}`);
         }
-        return `⚠️ 針對 ${prediction.symbol} 的覆盤因系統連線異常而失敗。`;
+        return `### 🏷️ 覆盤標的：【${stockName} (${prediction.symbol})】\n⚠️ 覆盤因系統連線異常而失敗。`;
     }
 }
 
@@ -141,14 +146,14 @@ async function runWeeklyReview() {
 
     logger.info(`🔍 發現 ${duePredictions.length} 筆到期的預言，準備開獎...`);
 
-    let finalDiscordReport = `## 🦉 AI 深夜殘酷對帳與覆盤報告\n今晚共有 **${duePredictions.length}** 筆一週前的分析報告到期，以下是 AI 結合最新市場數據的自我反省：\n\n`;
+    let finalDiscordReport = `## 🦉 AI 深夜殘酷對帳與覆盤報告\n今晚共有 **${duePredictions.length}** 筆一週前的分析報告到期，以下是 AI 結合最新市場數據的精簡反省：\n\n`;
 
     for (const prediction of duePredictions) {
+        // 取得已經包裝好標題與股名的覆盤內容
         const reviewContent = await evaluatePrediction(prediction);
         
-        finalDiscordReport += `### 🏷️ 覆盤標的：【${prediction.symbol}】 (預言單號 #${prediction.id})\n`;
-        finalDiscordReport += `${reviewContent}\n\n`;
-        finalDiscordReport += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        finalDiscordReport += `${reviewContent}\n`;
+        finalDiscordReport += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
         // 避免打 API 頻率過高觸發 Rate Limit，暫停 4 秒
         await new Promise(res => setTimeout(res, 4000));

@@ -44,6 +44,16 @@ function initDB() {
         );
     `);
     
+    // 🌟 [新增] 用來儲存對話總結與投資建議的資料表
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS chat_advice_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+    `);
+    
     logger.info('✅ [DB] SQLite 資料庫與資料表初始化完成');
 }
 initDB();
@@ -93,7 +103,10 @@ const stmts = {
 
     insertPrediction: db.prepare(`INSERT INTO predictions (source, symbol, prediction_text, created_at, target_date) VALUES (?, ?, ?, ?, ?)`),
     getPendingPredictions: db.prepare(`SELECT * FROM predictions WHERE status = 'PENDING' AND target_date <= ?`),
-    updatePredictionStatus: db.prepare(`UPDATE predictions SET status = 'EVALUATED' WHERE id = ?`)
+    updatePredictionStatus: db.prepare(`UPDATE predictions SET status = 'EVALUATED' WHERE id = ?`),
+    
+    // 🌟 [新增] 寫入對話投資建議的預備語句
+    insertAdvice: db.prepare(`INSERT INTO chat_advice_history (channel_id, summary, created_at) VALUES (?, ?, ?)`)
 };
 
 function isArticleExists(url) {
@@ -204,6 +217,20 @@ function markPredictionEvaluated(id) {
     logger.info(`✅ [DB] 已將預言單號 #${id} 標記為 EVALUATED (已覆盤)。`);
 }
 
+/**
+ * 🌟 [新增功能] 儲存 AI 從對話中總結出的投資建議
+ */
+function saveAdvice({ channelId, summary, timestamp }) {
+    try {
+        // 確保 timestamp 轉換為 ISO 字串，若未提供則抓當下時間
+        const timeStr = timestamp ? new Date(timestamp).toISOString() : new Date().toISOString();
+        stmts.insertAdvice.run(channelId, summary, timeStr);
+        logger.info(`💾 [DB] 成功將頻道 ${channelId} 的對話投資建議存入資料庫。`);
+    } catch (err) {
+        logger.error(`❌ [DB] 儲存對話投資建議失敗: ${err.message}`);
+    }
+}
+
 async function getEmbedding(text) {
     try {
         const response = await axios.post('http://127.0.0.1:11434/api/embeddings', {
@@ -242,11 +269,12 @@ module.exports = {
     saveNewsWithTags,
     getRecentNews,
     searchNewsByKeyword,
-    searchNewsByGeneralKeywords, // 匯出新功能
+    searchNewsByGeneralKeywords,
     cleanOldNews, 
     savePrediction,
     getDuePredictions,
     markPredictionEvaluated,
+    saveAdvice, // 🌟 [新增] 記得匯出此函式供 bot.js 呼叫
     saveVectorMemory,
     queryVectorMemory
 };

@@ -19,16 +19,23 @@ const twDictPath = path.join(__dirname, '../tw_stocks.json');
 const usDictPath = path.join(__dirname, '../us_stocks.json');
 let stockLookupMap = {}; // 格式將為: { "雙鴻": "3324", "台積電": "2330", "輝達": "NVDA" }
 
+// 🌟 同步 bot.js 的名稱淨化功能 (去除星號等特殊字元)
+const cleanName = (str) => {
+    if (!str) return '';
+    return str.toString().replace(/[*＊+＋]/g, '').trim();
+};
+
 function parseDictionary(data) {
     if (Array.isArray(data)) {
         data.forEach(item => {
             const sym = item.symbol || item.Symbol || item.Ticker || item.代號;
-            const name = item.name || item.Name || item.名稱 || item.股名;
-            if (sym && name) {
+            const rawName = item.name || item.Name || item.名稱 || item.股名;
+            if (sym && rawName) {
+                const name = cleanName(rawName);
                 // 移除原有的 .TW 或 .TWO，保留純代號
                 const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
-                stockLookupMap[name.toString().trim()] = cleanSym; 
-                stockLookupMap[cleanSym] = name.toString().trim(); // 反向映射也存一份，供走馬燈使用
+                stockLookupMap[name] = cleanSym; 
+                stockLookupMap[cleanSym] = name; // 反向映射也存一份，供走馬燈使用
             }
         });
     } else if (typeof data === 'object') {
@@ -36,13 +43,13 @@ function parseDictionary(data) {
             let name, sym;
             // 判斷誰是代號 (純英數)
             if (/^[A-Za-z0-9]+$/.test(k) && !/^[A-Za-z0-9]+$/.test(v)) {
-                sym = k; name = v;
+                sym = k; name = cleanName(v);
             } else {
-                sym = v; name = k; // 預設 k 是中文
+                sym = v; name = cleanName(k); // 預設 k 是中文
             }
             const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
-            stockLookupMap[name.toString().trim()] = cleanSym;
-            stockLookupMap[cleanSym] = name.toString().trim();
+            stockLookupMap[name] = cleanSym;
+            stockLookupMap[cleanSym] = name;
         }
     }
 }
@@ -196,7 +203,7 @@ async function fetchTargetsData(targets, symbols) {
 }
 
 /**
- * 📈 模組 5：個股即時走勢與報價速查 (供 Discord !查 指令使用)
+ * 📈 模組 5：個股即時走勢與報價速查 (供 Discord 擷取即時資訊)
  * 🌟 內建名稱轉代號字典查表、以及強化的上市/上櫃 (.TW / .TWO) 自動切換機制
  */
 async function fetchStockTrend(rawInput) {
@@ -220,7 +227,6 @@ async function fetchStockTrend(rawInput) {
 
     logger.info(`🔍 [Market API] 啟動即時查價，初始解析標的: ${symbol}...`);
 
-    // 🌟 將抓取邏輯包裝成獨立函數，方便發生錯誤時無縫重試
     const executeFetch = async (targetSymbol) => {
         // A. 抓取即時報價
         const quote = await yahooFinance.quote(targetSymbol);
@@ -251,7 +257,8 @@ async function fetchStockTrend(rawInput) {
         return {
             symbol: targetSymbol,
             name: quote.shortName || quote.longName || targetSymbol,
-            currentPrice: quote.regularMarketPrice,
+            price: quote.regularMarketPrice,         // 🌟 新增 price 以相容 bot.js
+            currentPrice: quote.regularMarketPrice,  // 舊有 currentPrice 保留
             change: quote.regularMarketChange,
             changePercent: (quote.regularMarketChangePercent || 0).toFixed(2) + '%',
             volume: quote.regularMarketVolume,
@@ -308,8 +315,7 @@ async function getMarketSnapshot(includeInstitutional = false, includeTwStock = 
 }
 
 /**
- * 🚀 新功能：從 Yahoo Finance 獲取熱門股票 (Trending) 
- * 供系統初始化儲存熱門股備用
+ * 🚀 從 Yahoo Finance 獲取熱門股票 (Trending) 
  */
 async function getTrendingSymbols() {
     try {
@@ -326,7 +332,7 @@ async function getTrendingSymbols() {
 }
 
 /**
- * 🚀 新功能：批量獲取股票報價，並格式化為 Discord 走馬燈字串
+ * 🚀 批量獲取股票報價，並格式化為 Discord 走馬燈字串
  * 格式範例：台積電 2,355.00▲30.00      旺宏 143.0▼13.50
  */
 async function getFormattedQuotes(symbols, customDictionary = {}) {

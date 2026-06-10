@@ -2,7 +2,6 @@
 const cron = require('node-cron');
 const logger = require('./logger');
 const db = require('./db');
-const { sendReportToDiscord } = require('./bot'); 
 
 const cteeScraper = require('./ctee_scraper');
 const udnScraper = require('./udn_scraper');
@@ -37,14 +36,14 @@ async function executeNewsETL(scraperModule, sourceName) {
 
         for (const article of newArticles) {
             try {
-                // 🌟 核心修改：不再裁切！直接將整篇文章的完整內文存入 content 欄位
+                // 🌟 核心修改：不再裁切！直接將整篇文章的完整內文存入 content 欄位，供 AI 群聊 RAG 檢索使用
                 const safeContent = article.content || '';
                 
                 const recordToSave = {
                     url: article.url,
                     title: article.title,
                     summary: '', // 背景不再浪費算力做摘要
-                    content: safeContent // 完整內文保留，供後續 !詳查 使用
+                    content: safeContent 
                 };
 
                 db.saveNewsWithTags(recordToSave, article.symbols || []);
@@ -91,6 +90,7 @@ async function triggerAllETL() {
 // ==========================================
 logger.info('⏰ [排程器] 輕量化核心排程引擎已啟動。');
 
+// 每 30 分鐘清理一次過期新聞 (保留 72 小時)
 cron.schedule('*/30 * * * *', () => {
     logger.info('🧹 [排程器] 觸發例行維護：清理過期新聞...');
     if (typeof db.cleanOldNews === 'function') {
@@ -98,11 +98,13 @@ cron.schedule('*/30 * * * *', () => {
     }
 }, { timezone: "Asia/Taipei" });
 
+// 每小時整點抓取一次新聞
 cron.schedule('0 * * * *', async () => {
     logger.info('🕸️ [排程器] 定時觸發全網財經新聞輕量抓取...');
     await triggerAllETL(); 
 }, { timezone: "Asia/Taipei" });
 
+// 每天凌晨 2:00 執行夜間覆盤程序
 cron.schedule('0 2 * * *', async () => {
     logger.info('🌙 [排程器] 啟動夜間覆盤程序：檢驗一週前的詳查報告...');
     try {
@@ -110,7 +112,11 @@ cron.schedule('0 2 * * *', async () => {
         const reviewContent = await nightReview.runWeeklyReview();
         
         if (reviewContent) {
-            await sendReportToDiscord(`\n========== 【🌙 AI 一週回測殘酷覆盤】 ==========\n${reviewContent}\n====================================\n`);
+            // 🌟 核心修改：Lazy load 延遲載入 bot.js，徹底解決與 bot.js 互相 require 導致的 Crash 問題
+            const { sendReportToDiscord } = require('./bot'); 
+            
+            // night_review.js 已經幫我們做好標題與排版，直接傳送即可
+            await sendReportToDiscord(reviewContent);
         } else {
             logger.info('🌙 [排程器] 今日無一週前之報告需覆盤，跳過推播。');
         }
