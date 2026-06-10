@@ -13,13 +13,15 @@ const path = require('path');
 const logger = require('../logger');
 
 // ==========================================
-// 📖 字典載入 (供查價模組反查代號使用)
+// 📖 字典載入 (拆分為兩張獨立的表，防止 2327 -> 國巨 -> Yahoo報錯 的慘劇)
 // ==========================================
 const twDictPath = path.join(__dirname, '../tw_stocks.json');
 const usDictPath = path.join(__dirname, '../us_stocks.json');
-let stockLookupMap = {}; // 格式將為: { "雙鴻": "3324", "台積電": "2330", "輝達": "NVDA" }
 
-// 🌟 同步 bot.js 的名稱淨化功能 (去除星號等特殊字元)
+let nameToSymbolMap = {}; // 用於：輸入 "國巨" -> 找出 "2327" 去查價
+let symbolToNameMap = {}; // 用於：輸入 "2327" -> 找出 "國巨" 顯示在走馬燈上
+
+// 同步 bot.js 的名稱淨化功能 (去除星號等特殊字元)
 const cleanName = (str) => {
     if (!str) return '';
     return str.toString().replace(/[*＊+＋]/g, '').trim();
@@ -32,24 +34,22 @@ function parseDictionary(data) {
             const rawName = item.name || item.Name || item.名稱 || item.股名;
             if (sym && rawName) {
                 const name = cleanName(rawName);
-                // 移除原有的 .TW 或 .TWO，保留純代號
                 const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
-                stockLookupMap[name] = cleanSym; 
-                stockLookupMap[cleanSym] = name; // 反向映射也存一份，供走馬燈使用
+                nameToSymbolMap[name] = cleanSym; 
+                symbolToNameMap[cleanSym] = name; 
             }
         });
     } else if (typeof data === 'object') {
         for (const [k, v] of Object.entries(data)) {
             let name, sym;
-            // 判斷誰是代號 (純英數)
-            if (/^[A-Za-z0-9]+$/.test(k) && !/^[A-Za-z0-9]+$/.test(v)) {
+            if (/^[A-Za-z0-9.]+$/.test(k) && !/^[A-Za-z0-9.]+$/.test(v)) {
                 sym = k; name = cleanName(v);
             } else {
-                sym = v; name = cleanName(k); // 預設 k 是中文
+                sym = v; name = cleanName(k); 
             }
             const cleanSym = sym.toString().replace(/\.TW|\.TWO/gi, '');
-            stockLookupMap[name] = cleanSym;
-            stockLookupMap[cleanSym] = name;
+            nameToSymbolMap[name] = cleanSym;
+            symbolToNameMap[cleanSym] = name;
         }
     }
 }
@@ -163,14 +163,13 @@ async function fetchTargetsData(targets, symbols) {
             try {
                 quote = await yahooFinance.quote(symbol);
             } catch (err) {
-                // 如果是台股 (.TW) 且找不到，自動轉換為上櫃 (.TWO) 進行測試
                 if (symbol.endsWith('.TW') && err.message.includes('No data found')) {
                     const twoSymbol = symbol.replace('.TW', '.TWO');
                     logger.warn(`  ⚠️ 查無 ${symbol}，懷疑為上櫃股票，自動嘗試 ${twoSymbol} ...`);
-                    symbol = twoSymbol; // 替換為 .TWO
+                    symbol = twoSymbol; 
                     quote = await yahooFinance.quote(symbol);
                 } else {
-                    throw err; // 真實錯誤，拋出
+                    throw err; 
                 }
             }
             
@@ -183,11 +182,7 @@ async function fetchTargetsData(targets, symbols) {
                 peRatio: quote.trailingPE ? quote.trailingPE.toFixed(2) : 'N/A',         
                 fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,          
                 fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
-                chips_analysis: {
-                    top_15_buyers: [],
-                    top_15_sellers: [],
-                    summary_status: "無" 
-                }
+                chips_analysis: { top_15_buyers: [], top_15_sellers: [], summary_status: "無" }
             };
             logger.info(`  ✅ [成功] ${targetName}: 現價 ${quote.regularMarketPrice} (${results[targetName].changePercent})`);
             successCount++;
@@ -204,51 +199,50 @@ async function fetchTargetsData(targets, symbols) {
 
 /**
  * 📈 模組 5：個股即時走勢與報價速查 (供 Discord 擷取即時資訊)
- * 🌟 內建名稱轉代號字典查表、以及強化的上市/上櫃 (.TW / .TWO) 自動切換機制
  */
 async function fetchStockTrend(rawInput) {
     let input = rawInput.trim();
     
-    // 1. 字典反查：如果你輸入「雙鴻」，這裡會直接幫你轉成「3324」
-    if (stockLookupMap[input]) {
-        logger.info(`📖 [Market API] 觸發字典轉換: "${input}" -> 代號 "${stockLookupMap[input]}"`);
-        input = stockLookupMap[input];
+    // 1. 字典反查：只有在「名稱查代號表」找得到時才轉換 (例如 "國巨" -> "2327")
+    if (nameToSymbolMap[input]) {
+        logger.info(`📖 [Market API] 觸發字典轉換: 名稱 "${input}" -> 代號 "${nameToSymbolMap[input]}"`);
+        input = nameToSymbolMap[input];
     }
     
     let symbol = input.toUpperCase();
     let isTaiwan = false;
     let baseCode = symbol;
 
-    // 2. 判斷是否為台股 (純數字，或數字加A/B/C等)
     if (/^\d{4,6}[A-Z]?$/.test(symbol)) {
         isTaiwan = true;
-        symbol = `${symbol}.TW`; // 預設給予上市後綴 (.TW)
+        symbol = `${symbol}.TW`; 
     }
 
     logger.info(`🔍 [Market API] 啟動即時查價，初始解析標的: ${symbol}...`);
 
     const executeFetch = async (targetSymbol) => {
-        // A. 抓取即時報價
         const quote = await yahooFinance.quote(targetSymbol);
         if (!quote) throw new Error('No data found');
         
-        // B. 抓取歷史走勢 (近 30 天)
         const period1 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
         const period2 = new Date().toISOString().split('T')[0]; 
         
-        const historical = await yahooFinance.historical(targetSymbol, { period1, period2 });
+        // 🌟 修復 ^TWII 崩潰：加上 { validateResult: false } 關閉嚴格檢查
+        const historicalRaw = await yahooFinance.historical(targetSymbol, { period1, period2 }, { validateResult: false });
+        
+        // 🌟 手動濾除那些因為大盤還沒收盤，導致 close 為 null 的異常日子
+        const historical = historicalRaw.filter(day => day.close !== null && day.close !== undefined);
+
         if (!historical || historical.length === 0) {
-            throw new Error('No data found');
+            throw new Error('No valid historical data found (all nulls or empty).');
         }
 
-        // C. 整理近期的收盤價走勢
         const recentTrend = historical.slice(-10).map(day => ({
             date: day.date.toISOString().split('T')[0],
             close: day.close.toFixed(2),
             volume: day.volume
         }));
 
-        // D. 計算月線簡單均價 (20MA)
         const closes = historical.map(d => d.close);
         const monthlyAvg = closes.length > 0 ? (closes.reduce((sum, val) => sum + val, 0) / closes.length).toFixed(2) : 'N/A';
 
@@ -256,9 +250,9 @@ async function fetchStockTrend(rawInput) {
         
         return {
             symbol: targetSymbol,
-            name: quote.shortName || quote.longName || targetSymbol,
-            price: quote.regularMarketPrice,         // 🌟 新增 price 以相容 bot.js
-            currentPrice: quote.regularMarketPrice,  // 舊有 currentPrice 保留
+            name: quote.shortName || quote.longName || symbolToNameMap[baseCode] || targetSymbol,
+            price: quote.regularMarketPrice,         
+            currentPrice: quote.regularMarketPrice,  
             change: quote.regularMarketChange,
             changePercent: (quote.regularMarketChangePercent || 0).toFixed(2) + '%',
             volume: quote.regularMarketVolume,
@@ -271,12 +265,10 @@ async function fetchStockTrend(rawInput) {
     };
 
     try {
-        // 先嘗試原始標的 (例如 3324.TW 或 NVDA)
         return await executeFetch(symbol);
     } catch (error) {
-        // 🌟 核心修復：如果原始標的失敗，且是台股 (.TW)，自動重試上櫃 (.TWO)
         if (isTaiwan && symbol.endsWith('.TW') && error.message.includes('No data found')) {
-            logger.warn(`⚠️ 查無 ${symbol} 歷史資料，確認是否為上櫃股票，自動嘗試 ${baseCode}.TWO ...`);
+            logger.warn(`⚠️ 查無 ${symbol} 歷史資料，自動嘗試上櫃 ${baseCode}.TWO ...`);
             try {
                 return await executeFetch(`${baseCode}.TWO`);
             } catch (twoError) {
@@ -326,14 +318,12 @@ async function getTrendingSymbols() {
         return ['2330.TW', '2317.TW', '2454.TW'];
     } catch (error) {
         logger.warn(`獲取熱門股失敗，使用預設備用名單。原因: ${error.message}`);
-        // 回退至預設的台美股熱門標的
         return ['2330.TW', '2454.TW', '0050.TW', 'NVDA', 'TSLA', 'AAPL'];
     }
 }
 
 /**
  * 🚀 批量獲取股票報價，並格式化為 Discord 走馬燈字串
- * 格式範例：台積電 2,355.00▲30.00      旺宏 143.0▼13.50
  */
 async function getFormattedQuotes(symbols, customDictionary = {}) {
     if (!symbols || symbols.length === 0) return "暫無數據";
@@ -348,8 +338,8 @@ async function getFormattedQuotes(symbols, customDictionary = {}) {
             const symbol = quote.symbol;
             const pureSym = symbol.split('.')[0];
             
-            // 嘗試從外部傳入字典、內部 stockLookupMap 尋找名稱，找不到則使用代號
-            let name = customDictionary[symbol] || customDictionary[pureSym] || stockLookupMap[pureSym] || stockLookupMap[symbol] || pureSym;
+            // 使用「代號查名稱表」來確保走馬燈顯示中文
+            let name = customDictionary[symbol] || customDictionary[pureSym] || symbolToNameMap[pureSym] || symbolToNameMap[symbol] || pureSym;
             
             const price = quote.regularMarketPrice.toFixed(2);
             const change = quote.regularMarketChange || 0;
@@ -376,5 +366,5 @@ module.exports = {
     getInstitutionalInvestors,
     getTrendingSymbols,
     getFormattedQuotes,
-    stockLookupMap 
+    stockLookupMap: symbolToNameMap // 為了相容 night_review.js，將反查表作為 stockLookupMap 匯出
 };
