@@ -3,6 +3,9 @@ const cron = require('node-cron');
 const logger = require('./logger');
 const db = require('./db');
 
+// 🌟 核心修復：因為您是從 scheduler 啟動，必須在這裡強制喚醒機器人本體！
+const { sendReportToDiscord } = require('./bot'); 
+
 const cteeScraper = require('./ctee_scraper');
 const udnScraper = require('./udn_scraper');
 const cmoneyScraper = require('./cmoney_scraper');
@@ -112,10 +115,7 @@ cron.schedule('0 2 * * *', async () => {
         const reviewContent = await nightReview.runWeeklyReview();
         
         if (reviewContent) {
-            // 🌟 核心修改：Lazy load 延遲載入 bot.js，徹底解決與 bot.js 互相 require 導致的 Crash 問題
-            const { sendReportToDiscord } = require('./bot'); 
-            
-            // night_review.js 已經幫我們做好標題與排版，直接傳送即可
+            // night_review.js 已經幫我們做好標題與排版，直接呼叫 bot.js 的發送功能
             await sendReportToDiscord(reviewContent);
         } else {
             logger.info('🌙 [排程器] 今日無一週前之報告需覆盤，跳過推播。');
