@@ -129,32 +129,6 @@ function loadDictionaries() {
 }
 loadDictionaries();
 
-function mapNameToSymbol(name) {
-    if (!name) return null;
-    if (stockDict[name]) return stockDict[name];
-    
-    for (const [dictName, symbol] of Object.entries(stockDict)) {
-        if (dictName.length >= 2) {
-            if (name.includes(dictName) || dictName.includes(name)) {
-                return symbol;
-            }
-        }
-    }
-    return null;
-}
-
-function getChineseNameBySymbol(targetSymbol) {
-    if (!targetSymbol) return null;
-    const cleanTarget = targetSymbol.replace(/\.TW|\.TWO/gi, '').toUpperCase();
-    for (const [name, sym] of Object.entries(stockDict)) {
-        const cleanSym = sym.replace(/\.TW|\.TWO/gi, '').toUpperCase();
-        if (cleanSym === cleanTarget) {
-            return name; 
-        }
-    }
-    return null;
-}
-
 const qaFilePath = path.join(__dirname, '../output/pending_qa.json');
 function addPendingQA(user, question, evaluation = '', type = 'question') {
     let qaList = [];
@@ -167,19 +141,18 @@ function addPendingQA(user, question, evaluation = '', type = 'question') {
 }
 
 /**
- * 🌟 RAG 智能觀點探討與對話大腦 (全新改版以適應 bot.js 群聊)
+ * 🌟 RAG 智能觀點探討與對話大腦 (精準適應 bot.js 最新提示詞)
  */
 async function evaluateUserInput(userName, userInput, type) {
     if (type !== 'viewpoint') return '';
 
-    const isSystemReview = userName === 'System_Review'; // 判斷是否為系統背景在提取覆盤建議
+    const isSystemReview = userName === 'System_Review'; 
     logger.info(`[AI 引擎 - Gemini] ⚡ 準備處理 ${isSystemReview ? '系統覆盤總結' : '頻道群聊對話'}...`);
     const startTime = Date.now();
     
-    // 1. 關鍵字萃取與新聞 RAG (若是系統覆盤則不需要撈新聞)
+    // 1. 關鍵字萃取與新聞 RAG
     let newsStr = '';
     if (!isSystemReview) {
-        // 由於 userInput 是 bot.js 傳過來的「完整包含30句對話的長文本」，我們只取最後 300 字來萃取最新話題關鍵字
         const recentText = userInput.slice(-300); 
         const extractPrompt = `請從以下最新對話內容中，萃取出 1~3 個最重要的「實體股票名詞」或「財經關鍵字」。若無具體標的請回傳空陣列。\n對話：「${recentText}」\n你是一台嚴格的 JSON 生成器，只能輸出符合以下格式的純 JSON：\n{"keywords": ["關鍵字1", "關鍵字2"]}`;
         
@@ -195,36 +168,34 @@ async function evaluateUserInput(userName, userInput, type) {
             logger.info(`[AI 引擎 - Gemini] 🔍 萃取群聊關鍵字: [${keywords.join(', ')}]，準備檢索新聞庫...`);
             const relatedNews = db.searchNewsByGeneralKeywords(keywords, 3); 
             if (relatedNews.length > 0) {
-                // 將新聞轉為字串準備安插進 Prompt
                 newsStr = '\n【系統自動帶入：近期關聯新聞】\n' + relatedNews.map((n, i) => `[新聞 ${i+1}] ${n.title}\n時間: ${n.published_at}\n內文: ${n.content.substring(0, 300)}...`).join('\n\n') + '\n\n';
             }
         }
     }
 
-    // 2. 組裝最終 Prompt 
-    // bot.js 傳來的 userInput 結尾會有一句「請根據上述群聊紀錄與市場數據...」
-    // 如果有撈到新聞，我們就透過字串替換，把新聞巧妙地安插進去
+    // 2. 組裝最終 Prompt (修復字串替換錨點)
     let finalPromptWithNews = userInput;
     if (newsStr) {
+        // 🌟 核心修復：精準對應 bot.js 傳來的最後一句指令，並強制注入新聞過濾原則
         finalPromptWithNews = userInput.replace(
-            '請根據上述群聊紀錄與市場數據', 
-            newsStr + '請根據上述群聊紀錄、近期關聯新聞與市場數據'
+            '請你根據上述群聊紀錄的「最後一句話」進行直接且專業的回答。', 
+            newsStr + '【重要過濾指令】：以上新聞是由系統演算法自動帶入，可能包含與問題無關的雜訊。你必須具備獨立判斷能力，若新聞與使用者最新的問題無關，請【直接無視該新聞】，絕對不要硬塞進回覆中！\n請你根據上述群聊紀錄的「最後一句話」進行直接且專業的回答。'
         );
     }
 
     // 3. 呼叫大語言模型進行生成
     try {
-        // 設定系統角色指令 (System Instruction)
+        // 🌟 核心修改：徹底拔除聊天客服人格，改成高冷專業操盤手
         let sysInstruction = isSystemReview 
             ? "你是一個客觀、冷靜的投資紀錄系統，負責將群聊對話濃縮萃取成重點建議。" 
-            : "你是一個在 Discord 頻道參與股市群聊的AI專業分析師，語氣像真人一樣輕鬆自然。";
+            : "你是一位專業、客觀的台美股分析師與資深操盤手。請直接切入重點回答，絕對禁止以「喔，某某某」或是重複使用者的名字與問題作為開頭。拒絕說廢話。";
 
         const response = await callOpenRouter(finalPromptWithNews, sysInstruction, 0.4);
         
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
         logger.info(`[AI 引擎 - Gemini] ✅ 任務完成 (耗時: ${duration}s)`);
 
-        return response; // 🌟 核心修改：不再強加 🎯 符號與前綴標題，直接回傳純對話字串
+        return response;
 
     } catch (error) {
         logger.error(`[AI 引擎 - Gemini] ❌ 任務失敗: ${error.message}`);
@@ -233,9 +204,9 @@ async function evaluateUserInput(userName, userInput, type) {
 }
 
 /**
- * 以下為舊版 !查 功能保留的函式，雖然 bot.js 目前未使用，但保留供未來單獨呼叫需求
+ * 舊版功能保留
  */
-async function quickAnalyzeStock(symbol, stockData) { /* 略過，保留舊有邏輯不變 */ return "此功能已轉為群聊整合模式"; }
-async function detailedAnalyzeStock(symbol, stockData, userInput = '') { /* 略過，保留舊有邏輯不變 */ return "此功能已轉為群聊整合模式"; }
+async function quickAnalyzeStock(symbol, stockData) { return "此功能已轉為群聊整合模式"; }
+async function detailedAnalyzeStock(symbol, stockData, userInput = '') { return "此功能已轉為群聊整合模式"; }
 
 module.exports = { addPendingQA, evaluateUserInput, quickAnalyzeStock, detailedAnalyzeStock };
