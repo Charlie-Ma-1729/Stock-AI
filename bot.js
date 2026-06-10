@@ -134,38 +134,45 @@ client.on('messageCreate', async (message) => {
     const channelId = message.channel.id;
     const now = Date.now();
 
-    // 🌟 嚴格頻道分離：Watch Channel 只聽不回，Target Channel 才會講話
     const isWatchChannel = WATCH_CHANNELS.length === 0 || WATCH_CHANNELS.includes(channelId);
     const isTargetChannel = TARGET_CHANNEL_ID && channelId === TARGET_CHANNEL_ID;
 
-    // 只要是這兩種頻道之一，我們就默默抓取代號放進跑馬燈
     let detectedSymbols = [];
     if (isWatchChannel || isTargetChannel) {
         detectedSymbols = detectStocksInMessage(content); 
     }
 
-    // 🌟 如果「不是」對話目標頻道，到這裡就結束，絕對不准回覆
     if (!isTargetChannel) return; 
 
     try {
         let session = channelSessions.get(channelId);
         
         if (session && (now - session.lastUpdated > SESSION_EXPIRY_MS)) {
-            logger.info(`[記憶清空] 頻道 ${channelId} 閒置超過10分鐘，準備清空記憶並提取這輪的投資建議。`);
+            logger.info(`[記憶清空] 頻道 ${channelId} 閒置超過10分鐘，準備清空記憶。`);
             extractAndSaveAdvice(session.history, channelId);
             session = null; 
         }
 
+        // 🌟 核心修復 1：加入 activeSymbols 來記憶當前正在聊的股票
         if (!session) {
-            session = { history: [], lastUpdated: now };
+            session = { history: [], lastUpdated: now, activeSymbols: [] };
+        }
+
+        // 🌟 核心修復 2：上下文話題繼承機制
+        if (detectedSymbols.length > 0) {
+            // 如果用戶這句話有提到新股票，就更新當前話題
+            session.activeSymbols = detectedSymbols;
+        } else if (session.activeSymbols && session.activeSymbols.length > 0) {
+            // 如果用戶這句話沒提股票（例如只問"那走勢呢"），自動繼承上一檔討論的股票
+            detectedSymbols = session.activeSymbols;
+            logger.info(`[上下文繼承] 用戶未提及標的，自動沿用話題標的: ${detectedSymbols.join(', ')}`);
         }
 
         const waitMsg = await message.reply('💬 **分析中...**');
         
-        // 🌟 注入過去一週走勢，讓 AI 能回答架構的第 2 點
         let marketContext = "";
         if (detectedSymbols.length > 0) {
-            marketContext += "【系統自動帶入：用戶剛提及的股票最新報價與過去一週走勢】\n";
+            marketContext += "【系統自動帶入：當前話題標的之最新報價與過去一週走勢】\n";
             for (const sym of detectedSymbols) {
                 try {
                     const stockData = await marketApi.fetchStockTrend(sym);
@@ -193,7 +200,7 @@ ${marketContext}
 ${chatLog}
 
 請你根據上述群聊紀錄的「最後一句話」進行直接且專業的回答。
-(再次強調：請嚴格遵守上方的回答架構，絕對不要加上自己的名字前綴，也不要說出「XXX你在問...」等無意義的廢話，直接切入重點分析)：`;
+(再次強調：請嚴格判斷上下文正在討論的標的，絕對不要加上自己的名字前綴，也不要說出「XXX你在問...」等無意義的廢話，直接切入重點分析)：`;
 
         const answer = await ai_analyzer.evaluateUserInput(message.author.username, finalPrompt, 'viewpoint');
         

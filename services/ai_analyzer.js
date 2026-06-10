@@ -154,7 +154,13 @@ async function evaluateUserInput(userName, userInput, type) {
     let newsStr = '';
     if (!isSystemReview) {
         const recentText = userInput.slice(-300); 
-        const extractPrompt = `請從以下最新對話內容中，萃取出 1~3 個最重要的「實體股票名詞」或「財經關鍵字」。若無具體標的請回傳空陣列。\n對話：「${recentText}」\n你是一台嚴格的 JSON 生成器，只能輸出符合以下格式的純 JSON：\n{"keywords": ["關鍵字1", "關鍵字2"]}`;
+        
+        // 🌟 核心修復 3：嚴格防堵 AI 亂提普通詞彙去搜新聞
+        const extractPrompt = `請從以下最新對話內容中，萃取出最重要的「實體股票名稱」或「具體企業名稱」（如：台積電、奇鋐、蘋果）。
+【極度重要警告】：如果對話中沒有出現具體的公司或股票名稱，請務必回傳空陣列 []！絕對不可以把「走勢、未來、大盤、財報、股票、怎麼看」這種廣泛的普通詞彙當作關鍵字提取。
+對話：「${recentText}」
+你是一台嚴格的 JSON 生成器，只能輸出符合以下格式的純 JSON：
+{"keywords": ["股票名1"]} 或 {"keywords": []}`;
         
         let keywords = [];
         try {
